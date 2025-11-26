@@ -934,9 +934,6 @@ pub async fn setup_database(pool: &PgPool) -> Result<(), sqlx::Error> {
             updated_at TIMESTAMPTZ DEFAULT NOW()
         );
 
-        -- Add column if it doesn't exist (for migration)
-        ALTER TABLE mining_sessions ADD COLUMN IF NOT EXISTS profitability VARCHAR(20);
-
         CREATE INDEX IF NOT EXISTS idx_sessions_user ON mining_sessions(user_id);
         CREATE INDEX IF NOT EXISTS idx_sessions_round ON mining_sessions(round_id);
         "#,
