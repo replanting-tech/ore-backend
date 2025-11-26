@@ -1081,21 +1081,6 @@ fn calculate_profitability(deployed_amount_lamports: i64, rewards_sol: i64) -> S
     }
 }
 
-// Update profitability for a mining session
-async fn update_session_profitability(db: &PgPool, session_id: uuid::Uuid, deployed_amount: i64, rewards_sol: i64) -> Result<(), ApiError> {
-    let profitability = calculate_profitability(deployed_amount, rewards_sol);
-
-    sqlx::query(
-        "UPDATE mining_sessions SET profitability = $1, updated_at = NOW() WHERE id = $2"
-    )
-    .bind(&profitability)
-    .bind(session_id)
-    .execute(db)
-    .await?;
-
-    info!("Updated session {} profitability to {}", session_id, profitability);
-    Ok(())
-}
 
 async fn deploy(
     State(state): State<Arc<AppState>>,
