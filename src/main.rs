@@ -378,6 +378,7 @@ pub struct MiningSession {
     pub rewards_sol: i64,
     pub rewards_ore: i64,
     pub claimed: bool,
+    pub profitability: Option<String>, // "win", "loss", "breakeven", or null if not calculated
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -928,9 +929,13 @@ pub async fn setup_database(pool: &PgPool) -> Result<(), sqlx::Error> {
             rewards_sol BIGINT DEFAULT 0,
             rewards_ore BIGINT DEFAULT 0,
             claimed BOOLEAN DEFAULT FALSE,
+            profitability VARCHAR(20), -- "win", "loss", "breakeven", or null
             created_at TIMESTAMPTZ DEFAULT NOW(),
             updated_at TIMESTAMPTZ DEFAULT NOW()
         );
+
+        -- Add column if it doesn't exist (for migration)
+        ALTER TABLE mining_sessions ADD COLUMN IF NOT EXISTS profitability VARCHAR(20);
 
         CREATE INDEX IF NOT EXISTS idx_sessions_user ON mining_sessions(user_id);
         CREATE INDEX IF NOT EXISTS idx_sessions_round ON mining_sessions(round_id);
@@ -1006,7 +1011,7 @@ async fn get_user_sessions(
     State(state): State<Arc<AppState>>,
     Path(wallet): Path<String>,
 ) -> Result<Json<Vec<MiningSession>>, ApiError> {
-    let sessions = sqlx::query_as::<_, MiningSession>(
+    let mut sessions = sqlx::query_as::<_, MiningSession>(
         r#"
         SELECT ms.* FROM mining_sessions ms
         JOIN users u ON ms.user_id = u.id
@@ -1018,6 +1023,22 @@ async fn get_user_sessions(
     .bind(&wallet)
     .fetch_all(&state.db)
     .await?;
+
+    // Calculate profitability for sessions that don't have it set
+    for session in &mut sessions {
+        if session.profitability.is_none() && session.rewards_sol > 0 {
+            session.profitability = Some(calculate_profitability(session.deployed_amount, session.rewards_sol));
+
+            // Update in database
+            sqlx::query(
+                "UPDATE mining_sessions SET profitability = $1, updated_at = NOW() WHERE id = $2"
+            )
+            .bind(&session.profitability)
+            .bind(session.id)
+            .execute(&state.db)
+            .await?;
+        }
+    }
 
     Ok(Json(sessions))
 }
@@ -1044,6 +1065,36 @@ async fn get_or_create_user(db: &PgPool, wallet_address: &str) -> Result<User, A
 
     info!("Created new user: {}", wallet_address);
     Ok(user)
+}
+
+// Calculate profitability for a mining session
+fn calculate_profitability(deployed_amount_lamports: i64, rewards_sol: i64) -> String {
+    let deployed_sol = deployed_amount_lamports as f64 / blockchain::LAMPORTS_PER_SOL as f64;
+    let rewards_sol_f64 = rewards_sol as f64 / blockchain::LAMPORTS_PER_SOL as f64;
+
+    if (rewards_sol_f64 - deployed_sol).abs() < 0.000001 { // Account for floating point precision
+        "breakeven".to_string()
+    } else if rewards_sol_f64 > deployed_sol {
+        "win".to_string()
+    } else {
+        "loss".to_string()
+    }
+}
+
+// Update profitability for a mining session
+async fn update_session_profitability(db: &PgPool, session_id: uuid::Uuid, deployed_amount: i64, rewards_sol: i64) -> Result<(), ApiError> {
+    let profitability = calculate_profitability(deployed_amount, rewards_sol);
+
+    sqlx::query(
+        "UPDATE mining_sessions SET profitability = $1, updated_at = NOW() WHERE id = $2"
+    )
+    .bind(&profitability)
+    .bind(session_id)
+    .execute(db)
+    .await?;
+
+    info!("Updated session {} profitability to {}", session_id, profitability);
+    Ok(())
 }
 
 async fn deploy(
@@ -1181,6 +1232,86 @@ async fn global_stats(State(state): State<Arc<AppState>>) -> Result<Json<serde_j
     })))
 }
 
+async fn deployment_history(
+    State(state): State<Arc<AppState>>,
+    Path(wallet): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    // Get user sessions with profitability
+    let mut sessions: Vec<MiningSession> = sqlx::query_as::<_, MiningSession>(
+        r#"
+        SELECT ms.* FROM mining_sessions ms
+        JOIN users u ON ms.user_id = u.id
+        WHERE u.wallet_address = $1
+        ORDER BY ms.created_at DESC
+        LIMIT 100
+        "#,
+    )
+    .bind(&wallet)
+    .fetch_all(&state.db)
+    .await?;
+
+    // Calculate profitability for sessions that don't have it set
+    for session in &mut sessions {
+        if session.profitability.is_none() && session.rewards_sol > 0 {
+            session.profitability = Some(calculate_profitability(session.deployed_amount, session.rewards_sol));
+
+            // Update in database
+            sqlx::query(
+                "UPDATE mining_sessions SET profitability = $1, updated_at = NOW() WHERE id = $2"
+            )
+            .bind(&session.profitability)
+            .bind(session.id)
+            .execute(&state.db)
+            .await?;
+        }
+    }
+
+    // Calculate stats
+    let total_deploys = sessions.len();
+    let wins = sessions.iter().filter(|s| s.profitability.as_deref() == Some("win")).count();
+    let losses = sessions.iter().filter(|s| s.profitability.as_deref() == Some("loss")).count();
+    let breakevens = sessions.iter().filter(|s| s.profitability.as_deref() == Some("breakeven")).count();
+    let pending = sessions.iter().filter(|s| s.profitability.is_none()).count();
+
+    let total_deployed_lamports: i64 = sessions.iter().map(|s| s.deployed_amount).sum();
+    let total_rewards_sol: i64 = sessions.iter().map(|s| s.rewards_sol).sum();
+
+    let win_rate = if total_deploys > 0 {
+        (wins as f64) / (total_deploys as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    Ok(Json(serde_json::json!({
+        "wallet_address": wallet,
+        "total_deploys": total_deploys,
+        "stats": {
+            "wins": wins,
+            "losses": losses,
+            "breakevens": breakevens,
+            "pending": pending,
+            "win_rate_percentage": win_rate
+        },
+        "totals": {
+            "deployed_sol": total_deployed_lamports as f64 / blockchain::LAMPORTS_PER_SOL as f64,
+            "rewards_sol": total_rewards_sol as f64 / blockchain::LAMPORTS_PER_SOL as f64
+        },
+        "sessions": sessions.into_iter().map(|s| {
+            serde_json::json!({
+                "id": s.id,
+                "round_id": s.round_id,
+                "deployed_amount_sol": s.deployed_amount as f64 / blockchain::LAMPORTS_PER_SOL as f64,
+                "rewards_sol": s.rewards_sol as f64 / blockchain::LAMPORTS_PER_SOL as f64,
+                "rewards_ore": s.rewards_ore,
+                "claimed": s.claimed,
+                "profitability": s.profitability,
+                "created_at": s.created_at,
+                "updated_at": s.updated_at
+            })
+        }).collect::<Vec<_>>()
+    })))
+}
+
 // ============================================================================
 // Router
 // ============================================================================
@@ -1199,6 +1330,7 @@ fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/claim", post(claim))
         .route("/api/checkpoint", post(checkpoint))
         .route("/api/stats/global", get(global_stats))
+        .route("/api/miner/:wallet/history", get(deployment_history))
         .layer(
             CorsLayer::new()
                 .allow_origin(AllowOrigin::any())
@@ -1290,6 +1422,7 @@ async fn main() -> Result<(), anyhow::Error> {
     info!("   GET  /api/treasury");
     info!("   GET  /api/miner/:wallet");
     info!("   GET  /api/miner/:wallet/sessions");
+    info!("   GET  /api/miner/:wallet/history    <- Deployment history with win/loss");
     info!("   POST /api/user/register");
     info!("   POST /api/deploy");
     info!("   POST /api/claim");
