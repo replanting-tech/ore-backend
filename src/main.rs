@@ -383,6 +383,25 @@ pub struct MiningSession {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
+#[derive(Debug, Serialize, Deserialize, sqlx::FromRow)]
+pub struct MartingaleStrategy {
+    pub id: uuid::Uuid,
+    pub user_id: uuid::Uuid,
+    pub rounds: i32,
+    pub base_amount_sol: f64,
+    pub loss_multiplier: f64,
+    pub max_loss_sol: f64,
+    pub status: String, // "active", "completed", "stopped"
+    pub current_round: i32,
+    pub current_amount_sol: f64,
+    pub total_deployed_sol: f64,
+    pub total_rewards_sol: f64,
+    pub total_loss_sol: f64,
+    pub last_round_id: Option<i64>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MinerStats {
     pub address: String,
@@ -430,6 +449,15 @@ pub struct DeployRequest {
     pub wallet_address: String,
     pub amount: f64,
     pub square_id: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StartMartingaleRequest {
+    pub wallet_address: String,
+    pub rounds: i32,
+    pub base_amount_sol: f64,
+    pub loss_multiplier: f64,
+    pub max_loss_sol: f64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -934,8 +962,28 @@ pub async fn setup_database(pool: &PgPool) -> Result<(), sqlx::Error> {
             updated_at TIMESTAMPTZ DEFAULT NOW()
         );
 
+        CREATE TABLE IF NOT EXISTS martingale_strategies (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            user_id UUID NOT NULL REFERENCES users(id),
+            rounds INTEGER NOT NULL,
+            base_amount_sol DECIMAL(20,10) NOT NULL,
+            loss_multiplier DECIMAL(5,2) NOT NULL,
+            max_loss_sol DECIMAL(20,10) NOT NULL,
+            status VARCHAR(20) NOT NULL DEFAULT 'active',
+            current_round INTEGER DEFAULT 0,
+            current_amount_sol DECIMAL(20,10) NOT NULL,
+            total_deployed_sol DECIMAL(20,10) DEFAULT 0,
+            total_rewards_sol DECIMAL(20,10) DEFAULT 0,
+            total_loss_sol DECIMAL(20,10) DEFAULT 0,
+            last_round_id BIGINT,
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW()
+        );
+
         CREATE INDEX IF NOT EXISTS idx_sessions_user ON mining_sessions(user_id);
         CREATE INDEX IF NOT EXISTS idx_sessions_round ON mining_sessions(round_id);
+        CREATE INDEX IF NOT EXISTS idx_martingale_user ON martingale_strategies(user_id);
+        CREATE INDEX IF NOT EXISTS idx_martingale_status ON martingale_strategies(status);
         "#,
     )
     .execute(pool)
@@ -1170,6 +1218,314 @@ async fn checkpoint(State(state): State<Arc<AppState>>) -> Result<Json<serde_jso
     })))
 }
 
+async fn start_martingale(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<StartMartingaleRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    // Validate input
+    if payload.rounds <= 0 || payload.base_amount_sol <= 0.0 || payload.loss_multiplier <= 1.0 || payload.max_loss_sol <= 0.0 {
+        return Err(ApiError::BadRequest("Invalid parameters: rounds > 0, base_amount > 0, loss_multiplier > 1, max_loss > 0".into()));
+    }
+
+    if payload.wallet_address.len() != 44 {
+        return Err(ApiError::BadRequest("Invalid wallet address format".into()));
+    }
+
+    // Get or create user
+    let user = get_or_create_user(&state.db, &payload.wallet_address).await?;
+
+    // Check if user already has an active strategy
+    let existing: Option<MartingaleStrategy> = sqlx::query_as::<_, MartingaleStrategy>(
+        "SELECT * FROM martingale_strategies WHERE user_id = $1 AND status = 'active'"
+    )
+    .bind(user.id)
+    .fetch_optional(&state.db)
+    .await?;
+
+    if existing.is_some() {
+        return Err(ApiError::BadRequest("User already has an active Martingale strategy".into()));
+    }
+
+    // Create strategy record
+    let strategy: MartingaleStrategy = sqlx::query_as::<_, MartingaleStrategy>(
+        r#"
+        INSERT INTO martingale_strategies (
+            user_id, rounds, base_amount_sol, loss_multiplier, max_loss_sol,
+            current_amount_sol
+        ) VALUES ($1, $2, $3, $4, $5, $6)
+        RETURNING *
+        "#
+    )
+    .bind(user.id)
+    .bind(payload.rounds)
+    .bind(payload.base_amount_sol)
+    .bind(payload.loss_multiplier)
+    .bind(payload.max_loss_sol)
+    .bind(payload.base_amount_sol) // start with base amount
+    .fetch_one(&state.db)
+    .await?;
+
+    // Start the background task
+    let state_clone = state.clone();
+    let strategy_id = strategy.id;
+    tokio::spawn(async move {
+        run_martingale_strategy(state_clone, strategy_id).await;
+    });
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "strategy_id": strategy.id,
+        "message": "Martingale strategy started"
+    })))
+}
+
+async fn run_martingale_strategy(state: Arc<AppState>, strategy_id: uuid::Uuid) {
+    info!("Starting Martingale strategy execution for strategy: {}", strategy_id);
+
+    let mut last_round_id: Option<u64> = None;
+
+    loop {
+        // Check if strategy is still active
+        let strategy: Option<MartingaleStrategy> = sqlx::query_as::<_, MartingaleStrategy>(
+            "SELECT * FROM martingale_strategies WHERE id = $1"
+        )
+        .bind(strategy_id)
+        .fetch_optional(&state.db)
+        .await
+        .unwrap_or(None);
+
+        let strategy = match strategy {
+            Some(s) if s.status == "active" => s,
+            _ => {
+                info!("Martingale strategy {} is no longer active", strategy_id);
+                break;
+            }
+        };
+
+        // Get current board
+        let board = match blockchain::get_board_info(&state.rpc_client).await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("Failed to get board info for strategy {}: {}", strategy_id, e);
+                sleep(Duration::from_secs(10)).await;
+                continue;
+            }
+        };
+
+        // Check if round has changed
+        if let Some(last) = last_round_id {
+            if board.round_id != last {
+                // Round has ended, process the result
+                info!("Round {} ended for strategy {}, processing result", last, strategy_id);
+                if let Err(e) = process_round_result(&state, &strategy, last).await {
+                    error!("Failed to process round result for strategy {}: {}", strategy_id, e);
+                    // Continue anyway
+                }
+            }
+        }
+
+        // Update last_round_id
+        last_round_id = Some(board.round_id);
+
+        // Check if we need to deploy for current round
+        if strategy.last_round_id != Some(board.round_id as i64) && strategy.current_round < strategy.rounds {
+            info!("Deploying for round {} in strategy {}", board.round_id, strategy_id);
+            if let Err(e) = deploy_for_round(&state, &strategy, board.round_id).await {
+                error!("Failed to deploy for strategy {}: {}", strategy_id, e);
+                // If deployment fails, stop the strategy
+                sqlx::query(
+                    "UPDATE martingale_strategies SET status = 'stopped', updated_at = NOW() WHERE id = $1"
+                )
+                .bind(strategy_id)
+                .execute(&state.db)
+                .await
+                .unwrap_or_default();
+                break;
+            }
+        }
+
+        // Check if strategy is complete
+        let updated_strategy: Option<MartingaleStrategy> = sqlx::query_as::<_, MartingaleStrategy>(
+            "SELECT * FROM martingale_strategies WHERE id = $1"
+        )
+        .bind(strategy_id)
+        .fetch_optional(&state.db)
+        .await
+        .unwrap_or(None);
+
+        if let Some(s) = updated_strategy {
+            if s.current_round >= s.rounds || s.status != "active" {
+                info!("Martingale strategy {} completed", strategy_id);
+                break;
+            }
+        }
+
+        // Wait before next check
+        sleep(Duration::from_secs(30)).await;
+    }
+
+    info!("Martingale strategy {} execution finished", strategy_id);
+}
+
+async fn process_round_result(
+    state: &Arc<AppState>,
+    strategy: &MartingaleStrategy,
+    round_id: u64,
+) -> Result<(), ApiError> {
+    // Find the mining session for this round and user
+    let session: Option<MiningSession> = sqlx::query_as::<_, MiningSession>(
+        r#"
+        SELECT ms.* FROM mining_sessions ms
+        JOIN users u ON ms.user_id = u.id
+        WHERE u.id = $1 AND ms.round_id = $2
+        ORDER BY ms.created_at DESC
+        LIMIT 1
+        "#
+    )
+    .bind(strategy.user_id)
+    .bind(round_id as i64)
+    .fetch_optional(&state.db)
+    .await?;
+
+    let session = match session {
+        Some(s) => s,
+        None => {
+            warn!("No mining session found for user {} in round {}", strategy.user_id, round_id);
+            return Ok(());
+        }
+    };
+
+    // Calculate profitability if not already done
+    let profitability = if let Some(p) = &session.profitability {
+        p.clone()
+    } else {
+        let p = calculate_profitability(session.deployed_amount, session.rewards_sol);
+        // Update session
+        sqlx::query(
+            "UPDATE mining_sessions SET profitability = $1, updated_at = NOW() WHERE id = $2"
+        )
+        .bind(&p)
+        .bind(session.id)
+        .execute(&state.db)
+        .await?;
+        p
+    };
+
+    let deployed_sol = session.deployed_amount as f64 / blockchain::LAMPORTS_PER_SOL as f64;
+    let rewards_sol = session.rewards_sol as f64 / blockchain::LAMPORTS_PER_SOL as f64;
+    let loss = deployed_sol - rewards_sol;
+
+    // Update strategy totals
+    let new_total_deployed = strategy.total_deployed_sol + deployed_sol;
+    let new_total_rewards = strategy.total_rewards_sol + rewards_sol;
+    let new_total_loss = strategy.total_loss_sol + if loss > 0.0 { loss } else { 0.0 };
+
+    let mut new_current_amount = strategy.current_amount_sol;
+    let mut new_current_round = strategy.current_round;
+
+    if profitability == "loss" {
+        new_current_amount *= strategy.loss_multiplier;
+        // Check max loss
+        if new_total_loss + new_current_amount > strategy.max_loss_sol {
+            // Stop strategy
+            sqlx::query(
+                r#"
+                UPDATE martingale_strategies
+                SET status = 'stopped', total_deployed_sol = $1, total_rewards_sol = $2,
+                    total_loss_sol = $3, updated_at = NOW()
+                WHERE id = $4
+                "#
+            )
+            .bind(new_total_deployed)
+            .bind(new_total_rewards)
+            .bind(new_total_loss)
+            .bind(strategy.id)
+            .execute(&state.db)
+            .await?;
+            return Ok(());
+        }
+    } else {
+        // Win or breakeven, reset to base amount
+        new_current_amount = strategy.base_amount_sol;
+    }
+
+    new_current_round += 1;
+
+    // Update strategy
+    sqlx::query(
+        r#"
+        UPDATE martingale_strategies
+        SET current_round = $1, current_amount_sol = $2, total_deployed_sol = $3,
+            total_rewards_sol = $4, total_loss_sol = $5, updated_at = NOW()
+        WHERE id = $6
+        "#
+    )
+    .bind(new_current_round)
+    .bind(new_current_amount)
+    .bind(new_total_deployed)
+    .bind(new_total_rewards)
+    .bind(new_total_loss)
+    .bind(strategy.id)
+    .execute(&state.db)
+    .await?;
+
+    Ok(())
+}
+
+async fn deploy_for_round(
+    state: &Arc<AppState>,
+    strategy: &MartingaleStrategy,
+    round_id: u64,
+) -> Result<(), ApiError> {
+    // Get user wallet
+    let user: User = sqlx::query_as::<_, User>(
+        "SELECT * FROM users WHERE id = $1"
+    )
+    .bind(strategy.user_id)
+    .fetch_one(&state.db)
+    .await?;
+
+    // Checkpoint miner first
+    blockchain::checkpoint_miner(&state.rpc_client, &state.config.keypair_path, None).await?;
+
+    // Deploy
+    let amount_lamports = (strategy.current_amount_sol * blockchain::LAMPORTS_PER_SOL as f64) as u64;
+    let signature = blockchain::deploy_ore(
+        &state.rpc_client,
+        &state.config.keypair_path,
+        amount_lamports,
+        None, // deploy to all squares
+    ).await?;
+
+    // Create mining session record
+    sqlx::query(
+        r#"
+        INSERT INTO mining_sessions (
+            user_id, round_id, deployed_amount, squares, status
+        ) VALUES ($1, $2, $3, $4, 'active')
+        "#
+    )
+    .bind(strategy.user_id)
+    .bind(round_id as i64)
+    .bind(amount_lamports as i64)
+    .bind(vec![0i32,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24]) // all squares
+    .execute(&state.db)
+    .await?;
+
+    // Update strategy last_round_id
+    sqlx::query(
+        "UPDATE martingale_strategies SET last_round_id = $1, updated_at = NOW() WHERE id = $2"
+    )
+    .bind(round_id as i64)
+    .bind(strategy.id)
+    .execute(&state.db)
+    .await?;
+
+    info!("Deployed {} SOL for strategy {} in round {}", strategy.current_amount_sol, strategy.id, round_id);
+
+    Ok(())
+}
+
 async fn global_stats(State(state): State<Arc<AppState>>) -> Result<Json<serde_json::Value>, ApiError> {
     // Total sessions (deployments)
     let total_sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mining_sessions")
@@ -1311,6 +1667,7 @@ fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/deploy", post(deploy))
         .route("/api/claim", post(claim))
         .route("/api/checkpoint", post(checkpoint))
+        .route("/api/martingale/start", post(start_martingale))
         .route("/api/stats/global", get(global_stats))
         .route("/api/miner/:wallet/history", get(deployment_history))
         .layer(
@@ -1360,7 +1717,7 @@ async fn main() -> Result<(), anyhow::Error> {
         .connect(&config.database_url)
         .await?;
     
-    // setup_database(&db).await?;
+    setup_database(&db).await?;
     info!("Database connected and initialized");
 
     // Setup Redis
@@ -1409,6 +1766,7 @@ async fn main() -> Result<(), anyhow::Error> {
     info!("   POST /api/deploy");
     info!("   POST /api/claim");
     info!("   POST /api/checkpoint");
+    info!("   POST /api/martingale/start");
     info!("   GET  /api/stats/global");
 
     axum::serve(listener, app).await?;
