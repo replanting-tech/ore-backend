@@ -1315,6 +1315,145 @@ async fn get_active_mining_sessions(
     })))
 }
 
+async fn get_martingale_progress(
+    State(state): State<Arc<AppState>>,
+    Path(wallet): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if wallet.len() != 44 {
+        return Err(ApiError::BadRequest("Invalid wallet address format".into()));
+    }
+
+    // Get active strategy
+    let strategy: Option<MartingaleStrategy> = sqlx::query_as::<_, MartingaleStrategy>(
+        r#"
+        SELECT ms.* FROM martingale_strategies ms
+        JOIN users u ON ms.user_id = u.id
+        WHERE u.wallet_address = $1 AND ms.status = 'active'
+        ORDER BY ms.created_at DESC
+        LIMIT 1
+        "#
+    )
+    .bind(&wallet)
+    .fetch_optional(&state.db)
+    .await?;
+
+    if let Some(s) = strategy {
+        // Get all mining sessions for this strategy
+        let sessions: Vec<MiningSession> = sqlx::query_as::<_, MiningSession>(
+            r#"
+            SELECT ms.* FROM mining_sessions ms
+            WHERE ms.user_id = $1 AND ms.round_id <= $2
+            ORDER BY ms.round_id DESC
+            "#
+        )
+        .bind(s.user_id)
+        .bind(s.last_round_id.unwrap_or(0) as i64)
+        .fetch_all(&state.db)
+        .await?;
+
+        // Calculate detailed progress
+        let mut round_history = Vec::new();
+        let mut total_deployed = 0.0;
+        let mut total_rewards = 0.0;
+        let mut wins = 0;
+        let mut losses = 0;
+        let mut breakevens = 0;
+
+        for session in sessions {
+            let deployed_sol = session.deployed_amount as f64 / blockchain::LAMPORTS_PER_SOL as f64;
+            let rewards_sol = session.rewards_sol as f64 / blockchain::LAMPORTS_PER_SOL as f64;
+            let profit_loss = rewards_sol - deployed_sol;
+            let roi_percentage = if deployed_sol > 0.0 { (profit_loss / deployed_sol) * 100.0 } else { 0.0 };
+
+            let profitability = session.profitability
+                .unwrap_or_else(|| calculate_profitability(session.deployed_amount, session.rewards_sol));
+
+            match profitability.as_str() {
+                "win" => wins += 1,
+                "loss" => losses += 1,
+                "breakeven" => breakevens += 1,
+                _ => {}
+            }
+
+            total_deployed += deployed_sol;
+            total_rewards += rewards_sol;
+
+            round_history.push(serde_json::json!({
+                "round_id": session.round_id,
+                "deployed_amount_sol": deployed_sol,
+                "rewards_sol": rewards_sol,
+                "profit_loss_sol": profit_loss,
+                "roi_percentage": roi_percentage,
+                "profitability": profitability,
+                "status": session.status,
+                "claimed": session.claimed,
+                "created_at": session.created_at
+            }));
+        }
+
+        let remaining_rounds = strategy.rounds - strategy.current_round;
+        let total_profit_loss = total_rewards - total_deployed;
+        let overall_roi = if total_deployed > 0.0 { (total_profit_loss / total_deployed) * 100.0 } else { 0.0 };
+        let max_possible_loss = strategy.max_loss_sol - strategy.total_loss_sol;
+        let risk_level = if max_possible_loss < strategy.current_amount_sol * 0.5 {
+            "HIGH".to_string()
+        } else if max_possible_loss < strategy.current_amount_sol {
+            "MEDIUM".to_string()
+        } else {
+            "LOW".to_string()
+        };
+
+        Ok(Json(serde_json::json!({
+            "success": true,
+            "strategy_progress": {
+                "id": s.id,
+                "status": s.status,
+                "current_round": s.current_round,
+                "total_rounds": s.rounds,
+                "remaining_rounds": remaining_rounds,
+                "progress_percentage": (s.current_round as f64 / s.rounds as f64) * 100.0,
+                
+                "next_deployment": {
+                    "amount_sol": s.current_amount_sol,
+                    "round_id": s.last_round_id.map(|id| id + 1)
+                },
+                
+                "totals": {
+                    "deployed_sol": total_deployed,
+                    "rewards_sol": total_rewards,
+                    "profit_loss_sol": total_profit_loss,
+                    "overall_roi_percentage": overall_roi
+                },
+                
+                "risk_management": {
+                    "max_loss_limit_sol": s.max_loss_sol,
+                    "current_loss_sol": s.total_loss_sol,
+                    "remaining_loss_budget_sol": max_possible_loss,
+                    "risk_level": risk_level
+                },
+                
+                "performance": {
+                    "total_rounds_played": s.current_round,
+                    "wins": wins,
+                    "losses": losses,
+                    "breakevens": breakevens,
+                    "win_rate_percentage": if s.current_round > 0 { (wins as f64 / s.current_round as f64) * 100.0 } else { 0.0 }
+                },
+                
+                "round_history": round_history,
+                
+                "created_at": s.created_at,
+                "updated_at": s.updated_at
+            }
+        })))
+    } else {
+        Ok(Json(serde_json::json!({
+            "success": false,
+            "message": "No active martingale strategy found"
+        })))
+    }
+}
+
 async fn start_martingale(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<StartMartingaleRequest>,
@@ -1767,6 +1906,7 @@ fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/martingale/start", post(start_martingale))
         .route("/api/martingale/active/:wallet", get(get_active_martingale))
         .route("/api/mining/active/:wallet", get(get_active_mining_sessions))
+        .route("/api/martingale/progress/:wallet", get(get_martingale_progress))
         .route("/api/stats/global", get(global_stats))
         .route("/api/miner/:wallet/history", get(deployment_history))
         .layer(
@@ -1867,6 +2007,7 @@ async fn main() -> Result<(), anyhow::Error> {
     info!("   POST /api/checkpoint");
     info!("   POST /api/martingale/start");
     info!("   GET  /api/martingale/active/:wallet");
+    info!("   GET  /api/martingale/progress/:wallet");
     info!("   GET  /api/mining/active/:wallet");
     info!("   GET  /api/stats/global");
 
