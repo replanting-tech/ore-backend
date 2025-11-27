@@ -966,15 +966,15 @@ pub async fn setup_database(pool: &PgPool) -> Result<(), sqlx::Error> {
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             user_id UUID NOT NULL REFERENCES users(id),
             rounds INTEGER NOT NULL,
-            base_amount_sol DECIMAL(20,10) NOT NULL,
-            loss_multiplier DECIMAL(5,2) NOT NULL,
-            max_loss_sol DECIMAL(20,10) NOT NULL,
+            base_amount_sol DOUBLE PRECISION NOT NULL,
+            loss_multiplier DOUBLE PRECISION NOT NULL,
+            max_loss_sol DOUBLE PRECISION NOT NULL,
             status VARCHAR(20) NOT NULL DEFAULT 'active',
             current_round INTEGER DEFAULT 0,
-            current_amount_sol DECIMAL(20,10) NOT NULL,
-            total_deployed_sol DECIMAL(20,10) DEFAULT 0,
-            total_rewards_sol DECIMAL(20,10) DEFAULT 0,
-            total_loss_sol DECIMAL(20,10) DEFAULT 0,
+            current_amount_sol DOUBLE PRECISION NOT NULL,
+            total_deployed_sol DOUBLE PRECISION DEFAULT 0,
+            total_rewards_sol DOUBLE PRECISION DEFAULT 0,
+            total_loss_sol DOUBLE PRECISION DEFAULT 0,
             last_round_id BIGINT,
             created_at TIMESTAMPTZ DEFAULT NOW(),
             updated_at TIMESTAMPTZ DEFAULT NOW()
@@ -1215,6 +1215,103 @@ async fn checkpoint(State(state): State<Arc<AppState>>) -> Result<Json<serde_jso
     Ok(Json(serde_json::json!({
         "success": true,
         "signature": signature
+    })))
+}
+
+async fn get_active_martingale(
+    State(state): State<Arc<AppState>>,
+    Path(wallet): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if wallet.len() != 44 {
+        return Err(ApiError::BadRequest("Invalid wallet address format".into()));
+    }
+
+    let strategy: Option<MartingaleStrategy> = sqlx::query_as::<_, MartingaleStrategy>(
+        r#"
+        SELECT ms.* FROM martingale_strategies ms
+        JOIN users u ON ms.user_id = u.id
+        WHERE u.wallet_address = $1 AND ms.status = 'active'
+        ORDER BY ms.created_at DESC
+        LIMIT 1
+        "#
+    )
+    .bind(&wallet)
+    .fetch_optional(&state.db)
+    .await?;
+
+    match strategy {
+        Some(s) => Ok(Json(serde_json::json!({
+            "success": true,
+            "strategy": {
+                "id": s.id,
+                "rounds": s.rounds,
+                "base_amount_sol": s.base_amount_sol,
+                "loss_multiplier": s.loss_multiplier,
+                "max_loss_sol": s.max_loss_sol,
+                "status": s.status,
+                "current_round": s.current_round,
+                "current_amount_sol": s.current_amount_sol,
+                "total_deployed_sol": s.total_deployed_sol,
+                "total_rewards_sol": s.total_rewards_sol,
+                "total_loss_sol": s.total_loss_sol,
+                "last_round_id": s.last_round_id,
+                "created_at": s.created_at,
+                "updated_at": s.updated_at
+            }
+        }))),
+        None => Ok(Json(serde_json::json!({
+            "success": true,
+            "strategy": null,
+            "message": "No active martingale strategy found"
+        })))
+    }
+}
+
+async fn get_active_mining_sessions(
+    State(state): State<Arc<AppState>>,
+    Path(wallet): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if wallet.len() != 44 {
+        return Err(ApiError::BadRequest("Invalid wallet address format".into()));
+    }
+
+    let sessions: Vec<MiningSession> = sqlx::query_as::<_, MiningSession>(
+        r#"
+        SELECT ms.* FROM mining_sessions ms
+        JOIN users u ON ms.user_id = u.id
+        WHERE u.wallet_address = $1 AND ms.status = 'active'
+        ORDER BY ms.created_at DESC
+        LIMIT 50
+        "#
+    )
+    .bind(&wallet)
+    .fetch_all(&state.db)
+    .await?;
+
+    let sessions_with_calculations = sessions.into_iter().map(|s| {
+        let deployed_sol = s.deployed_amount as f64 / blockchain::LAMPORTS_PER_SOL as f64;
+        let rewards_sol = s.rewards_sol as f64 / blockchain::LAMPORTS_PER_SOL as f64;
+        
+        serde_json::json!({
+            "id": s.id,
+            "round_id": s.round_id,
+            "deployed_amount_sol": deployed_sol,
+            "rewards_sol": rewards_sol,
+            "rewards_ore": s.rewards_ore,
+            "squares": s.squares,
+            "status": s.status,
+            "claimed": s.claimed,
+            "profitability": s.profitability,
+            "created_at": s.created_at,
+            "updated_at": s.updated_at,
+            "profit_loss_sol": rewards_sol - deployed_sol
+        })
+    }).collect::<Vec<_>>();
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "active_sessions": sessions_with_calculations,
+        "total_active": sessions_with_calculations.len()
     })))
 }
 
@@ -1668,6 +1765,8 @@ fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/claim", post(claim))
         .route("/api/checkpoint", post(checkpoint))
         .route("/api/martingale/start", post(start_martingale))
+        .route("/api/martingale/active/:wallet", get(get_active_martingale))
+        .route("/api/mining/active/:wallet", get(get_active_mining_sessions))
         .route("/api/stats/global", get(global_stats))
         .route("/api/miner/:wallet/history", get(deployment_history))
         .layer(
@@ -1767,6 +1866,8 @@ async fn main() -> Result<(), anyhow::Error> {
     info!("   POST /api/claim");
     info!("   POST /api/checkpoint");
     info!("   POST /api/martingale/start");
+    info!("   GET  /api/martingale/active/:wallet");
+    info!("   GET  /api/mining/active/:wallet");
     info!("   GET  /api/stats/global");
 
     axum::serve(listener, app).await?;
