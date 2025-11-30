@@ -468,6 +468,49 @@ pub struct ClaimResponse {
 }
 
 // ============================================================================
+// RPC Error Handling Helpers
+// ============================================================================
+
+fn handle_transaction_rpc_error(e: &solana_client::client_error::ClientError) -> ApiError {
+    let error_msg = e.to_string();
+
+    if error_msg.contains("Insufficient funds for fee") {
+        ApiError::BadRequest(
+            "Insufficient SOL balance to pay for transaction fees. Please ensure your account has enough SOL to cover both the transaction amount and fees.".to_string()
+        )
+    } else if error_msg.contains("AccountNotFound") {
+        ApiError::NotFound
+    } else if error_msg.contains("BlockhashNotFound") {
+        ApiError::Internal(
+            "Transaction blockhash not found. This may be due to network delays. Please try again.".to_string()
+        )
+    } else if error_msg.contains("InvalidSignature") || error_msg.contains("signature verification failed") {
+        ApiError::BadRequest(
+            "Invalid transaction signature. Please check your keypair configuration.".to_string()
+        )
+    } else if error_msg.contains("Transaction simulation failed") {
+        if error_msg.contains("custom program error") {
+            ApiError::Internal(
+                "Transaction failed due to program logic error. This may be a temporary issue with the ORE program.".to_string()
+            )
+        } else {
+            ApiError::Internal(
+                "Transaction simulation failed. Please check your account balance and try again.".to_string()
+            )
+        }
+    } else if error_msg.contains("RPC response error") {
+        ApiError::Internal(
+            "Solana RPC network error. The blockchain network may be experiencing issues. Please try again later.".to_string()
+        )
+    } else {
+        error!("Unhandled transaction RPC error: {}", error_msg);
+        ApiError::Internal(
+            "Transaction failed due to blockchain network error. Please try again.".to_string()
+        )
+    }
+}
+
+// ============================================================================
 // RPC Retry Wrapper
 // ============================================================================
 
@@ -484,15 +527,15 @@ where
             Ok(result) => return Ok(result),
             Err(ApiError::Rpc(ref e)) => {
                 let error_msg = e.to_string();
-                
+
                 // Check if it's a rate limiting error
                 if error_msg.contains("429") || error_msg.contains("Too Many Requests") {
                     attempts += 1;
                     if attempts >= max_attempts {
                         error!("RPC rate limit exceeded after {} attempts: {}", attempts, error_msg);
-                        return Err(ApiError::Internal(format!("Rate limit exceeded after {} attempts: {}", attempts, error_msg)));
+                        return Err(ApiError::Internal(format!("RPC rate limit exceeded. The Solana network is experiencing high traffic. Please try again later.")));
                     }
-                    
+
                     // Exponential backoff (500ms, 1s, 2s)
                     let delay_millis = 500 * (2u64.pow(attempts - 1));
                     let delay = Duration::from_millis(delay_millis);
@@ -500,9 +543,53 @@ where
                     sleep(delay).await;
                     continue;
                 }
-                
-                // For other RPC errors, return immediately
-                return Err(ApiError::Internal(format!("RPC error: {}", error_msg)));
+
+                // Handle specific RPC errors with clear messages
+                if error_msg.contains("Insufficient funds for fee") {
+                    return Err(ApiError::BadRequest(
+                        "Insufficient SOL balance to pay for transaction fees. Please ensure your account has enough SOL to cover transaction costs.".to_string()
+                    ));
+                }
+
+                if error_msg.contains("AccountNotFound") {
+                    return Err(ApiError::NotFound);
+                }
+
+                if error_msg.contains("BlockhashNotFound") {
+                    return Err(ApiError::Internal(
+                        "Transaction blockhash not found. This may be due to network delays. Please try again.".to_string()
+                    ));
+                }
+
+                if error_msg.contains("InvalidSignature") || error_msg.contains("signature verification failed") {
+                    return Err(ApiError::BadRequest(
+                        "Invalid transaction signature. Please check your keypair configuration.".to_string()
+                    ));
+                }
+
+                if error_msg.contains("Transaction simulation failed") {
+                    // Extract more specific simulation error if possible
+                    if error_msg.contains("custom program error") {
+                        return Err(ApiError::Internal(
+                            "Transaction failed due to program logic error. This may be a temporary issue with the ORE program.".to_string()
+                        ));
+                    }
+                    return Err(ApiError::Internal(
+                        "Transaction simulation failed. Please check your account balance and try again.".to_string()
+                    ));
+                }
+
+                if error_msg.contains("RPC response error") {
+                    return Err(ApiError::Internal(
+                        "Solana RPC network error. The blockchain network may be experiencing issues. Please try again later.".to_string()
+                    ));
+                }
+
+                // For other RPC errors, return with generic message
+                error!("Unhandled RPC error: {}", error_msg);
+                return Err(ApiError::Internal(
+                    "Blockchain network error occurred. Please try again in a few moments.".to_string()
+                ));
             }
             Err(other_error) => return Err(other_error),
         }
@@ -1155,18 +1242,32 @@ async fn deploy(
 
     // Ensure miner is checkpointed before deploying
     info!("Checkpointing miner before deploy");
-    let checkpoint_signature = blockchain::checkpoint_miner(&state.rpc_client, &state.config.keypair_path, None).await?;
+    let checkpoint_signature = match blockchain::checkpoint_miner(&state.rpc_client, &state.config.keypair_path, None).await {
+        Ok(sig) => sig,
+        Err(ApiError::Rpc(e)) => {
+            error!("Checkpoint before deploy failed: {}", e);
+            return Err(handle_transaction_rpc_error(&e));
+        }
+        Err(other) => return Err(other),
+    };
     info!("Checkpoint completed: signature={}", checkpoint_signature);
 
     // Perform blockchain deployment
     info!("Performing blockchain deploy: amount={} lamports, square_id={:?}", amount_lamports, payload.square_id);
-    let signature = blockchain::deploy_ore(
+    let signature = match blockchain::deploy_ore(
         &state.rpc_client,
         &state.config.keypair_path,
         amount_lamports,
         payload.square_id,
     )
-    .await?;
+    .await {
+        Ok(sig) => sig,
+        Err(ApiError::Rpc(e)) => {
+            error!("Deploy transaction failed: {}", e);
+            return Err(handle_transaction_rpc_error(&e));
+        }
+        Err(other) => return Err(other),
+    };
     info!("Deploy transaction successful: signature={}", signature);
 
     // Create mining session record
@@ -1206,12 +1307,26 @@ async fn deploy(
 }
 
 async fn claim(State(state): State<Arc<AppState>>) -> Result<Json<ClaimResponse>, ApiError> {
-    let response = blockchain::claim_rewards(&state.rpc_client, &state.config.keypair_path).await?;
+    let response = match blockchain::claim_rewards(&state.rpc_client, &state.config.keypair_path).await {
+        Ok(res) => res,
+        Err(ApiError::Rpc(e)) => {
+            error!("Claim transaction failed: {}", e);
+            return Err(handle_transaction_rpc_error(&e));
+        }
+        Err(other) => return Err(other),
+    };
     Ok(Json(response))
 }
 
 async fn checkpoint(State(state): State<Arc<AppState>>) -> Result<Json<serde_json::Value>, ApiError> {
-    let signature = blockchain::checkpoint_miner(&state.rpc_client, &state.config.keypair_path, None).await?;
+    let signature = match blockchain::checkpoint_miner(&state.rpc_client, &state.config.keypair_path, None).await {
+        Ok(sig) => sig,
+        Err(ApiError::Rpc(e)) => {
+            error!("Checkpoint transaction failed: {}", e);
+            return Err(handle_transaction_rpc_error(&e));
+        }
+        Err(other) => return Err(other),
+    };
     Ok(Json(serde_json::json!({
         "success": true,
         "signature": signature
@@ -1722,16 +1837,31 @@ async fn deploy_for_round(
     .await?;
 
     // Checkpoint miner first
-    blockchain::checkpoint_miner(&state.rpc_client, &state.config.keypair_path, None).await?;
+    match blockchain::checkpoint_miner(&state.rpc_client, &state.config.keypair_path, None).await {
+        Ok(_) => {},
+        Err(ApiError::Rpc(e)) => {
+            error!("Martingale strategy {} checkpoint failed: {}", strategy.id, e);
+            return Err(handle_transaction_rpc_error(&e));
+        }
+        Err(other) => return Err(other),
+    };
 
     // Deploy
     let amount_lamports = (strategy.current_amount_sol * blockchain::LAMPORTS_PER_SOL as f64) as u64;
-    let signature = blockchain::deploy_ore(
+    let signature = match blockchain::deploy_ore(
         &state.rpc_client,
         &state.config.keypair_path,
         amount_lamports,
         None, // deploy to all squares
-    ).await?;
+    )
+    .await {
+        Ok(sig) => sig,
+        Err(ApiError::Rpc(e)) => {
+            error!("Martingale strategy {} deployment failed: {}", strategy.id, e);
+            return Err(handle_transaction_rpc_error(&e));
+        }
+        Err(other) => return Err(other),
+    };
 
     // Create mining session record
     sqlx::query(
