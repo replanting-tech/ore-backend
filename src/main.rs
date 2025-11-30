@@ -1506,13 +1506,13 @@ async fn get_martingale_progress(
             }));
         }
 
-        let remaining_rounds = strategy.rounds - strategy.current_round;
+        let remaining_rounds = s.rounds - s.current_round;
         let total_profit_loss = total_rewards - total_deployed;
         let overall_roi = if total_deployed > 0.0 { (total_profit_loss / total_deployed) * 100.0 } else { 0.0 };
-        let max_possible_loss = strategy.max_loss_sol - strategy.total_loss_sol;
-        let risk_level = if max_possible_loss < strategy.current_amount_sol * 0.5 {
+        let max_possible_loss = s.max_loss_sol - s.total_loss_sol;
+        let risk_level = if max_possible_loss < s.current_amount_sol * 0.5 {
             "HIGH".to_string()
-        } else if max_possible_loss < strategy.current_amount_sol {
+        } else if max_possible_loss < s.current_amount_sol {
             "MEDIUM".to_string()
         } else {
             "LOW".to_string()
@@ -1829,7 +1829,7 @@ async fn deploy_for_round(
     round_id: u64,
 ) -> Result<(), ApiError> {
     // Get user wallet
-    let user: User = sqlx::query_as::<_, User>(
+    let _user: User = sqlx::query_as::<_, User>(
         "SELECT * FROM users WHERE id = $1"
     )
     .bind(strategy.user_id)
@@ -1848,7 +1848,7 @@ async fn deploy_for_round(
 
     // Deploy
     let amount_lamports = (strategy.current_amount_sol * blockchain::LAMPORTS_PER_SOL as f64) as u64;
-    let signature = match blockchain::deploy_ore(
+    let _signature = match blockchain::deploy_ore(
         &state.rpc_client,
         &state.config.keypair_path,
         amount_lamports,
