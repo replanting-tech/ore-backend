@@ -618,6 +618,22 @@ pub mod blockchain {
         rpc: &RpcClient,
         authority: Pubkey,
     ) -> Result<MinerStats, ApiError> {
+        if std::env::var("SIMULATE_ORE").unwrap_or_default() == "true" {
+            return Ok(MinerStats {
+                address: "SimulatedMinerAddress".to_string(),
+                authority: authority.to_string(),
+                rewards_sol: 5.0,
+                rewards_ore: 100.0,
+                refined_ore: 50.0,
+                round_id: 12345,
+                checkpoint_id: 12344,
+                lifetime_rewards_sol: 25.0,
+                lifetime_rewards_ore: 500.0,
+                deployed: vec![1000; 25],
+                cumulative: vec![5000; 25],
+            });
+        }
+
         with_rpc_retry(|| async {
             let miner_pda = ore_api::state::miner_pda(authority);
             let account = match rpc.get_account(&miner_pda.0).await {
@@ -659,6 +675,16 @@ pub mod blockchain {
     }
 
     pub async fn get_board_info(rpc: &RpcClient) -> Result<BoardInfo, ApiError> {
+        if std::env::var("SIMULATE_ORE").unwrap_or_default() == "true" {
+            return Ok(BoardInfo {
+                round_id: 12345,
+                start_slot: 1000,
+                end_slot: 2000,
+                current_slot: 1500,
+                time_remaining_sec: 500.0,
+            });
+        }
+
         with_rpc_retry(|| async {
             let board_pda = ore_api::state::board_pda();
             let account = match rpc.get_account(&board_pda.0).await {
@@ -712,6 +738,17 @@ pub mod blockchain {
     }
 
     pub async fn get_treasury_info(rpc: &RpcClient) -> Result<TreasuryInfo, ApiError> {
+        if std::env::var("SIMULATE_ORE").unwrap_or_default() == "true" {
+            return Ok(TreasuryInfo {
+                address: "SimulatedTreasuryAddress".to_string(),
+                balance_sol: 10000.0,
+                motherlode_ore: 50000.0,
+                total_staked: 100000.0,
+                total_unclaimed: 5000.0,
+                total_refined: 20000.0,
+            });
+        }
+
         with_rpc_retry(|| async {
             let treasury_pda = ore_api::state::treasury_pda();
             let account = match rpc.get_account(&treasury_pda.0).await {
@@ -748,6 +785,19 @@ pub mod blockchain {
     }
 
     pub async fn get_square_stats(rpc: &RpcClient) -> Result<Vec<SquareStats>, ApiError> {
+        if std::env::var("SIMULATE_ORE").unwrap_or_default() == "true" {
+            let mut square_stats = Vec::new();
+            for i in 0..25 {
+                square_stats.push(SquareStats {
+                    square_id: i,
+                    participants: 10 + (i as u64 % 15),
+                    competition_level: 0.5 + (i as f64 * 0.02),
+                    total_deployed: 1000000 + (i as u64 * 50000),
+                });
+            }
+            return Ok(square_stats);
+        }
+
         let board_pda = ore_api::state::board_pda();
         let account = match rpc.get_account(&board_pda.0).await {
             Ok(account) => account,
@@ -831,6 +881,10 @@ pub mod blockchain {
         amount: u64,
         square_id: Option<u64>,
     ) -> Result<String, ApiError> {
+        if std::env::var("SIMULATE_ORE").unwrap_or_default() == "true" {
+            return Ok("SimulatedDeploySignature1234567890abcdef".to_string());
+        }
+
         let payer = read_keypair_file(keypair_path)
             .map_err(|e| ApiError::BadRequest(format!("Keypair error: {}", e)))?;
 
@@ -885,6 +939,14 @@ pub mod blockchain {
         rpc: &RpcClient,
         keypair_path: &str,
     ) -> Result<ClaimResponse, ApiError> {
+        if std::env::var("SIMULATE_ORE").unwrap_or_default() == "true" {
+            return Ok(ClaimResponse {
+                signature: "SimulatedClaimSignature1234567890abcdef".to_string(),
+                sol_claimed: 2.5,
+                ore_claimed: 50.0,
+            });
+        }
+
         let payer = read_keypair_file(keypair_path)
             .map_err(|e| ApiError::BadRequest(format!("Keypair error: {}", e)))?;
 
@@ -924,6 +986,10 @@ pub mod blockchain {
         keypair_path: &str,
         authority: Option<Pubkey>,
     ) -> Result<String, ApiError> {
+        if std::env::var("SIMULATE_ORE").unwrap_or_default() == "true" {
+            return Ok("SimulatedCheckpointSignature1234567890abcdef".to_string());
+        }
+
         let payer = read_keypair_file(keypair_path)
             .map_err(|e| ApiError::BadRequest(format!("Keypair error: {}", e)))?;
 
