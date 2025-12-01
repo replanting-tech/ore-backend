@@ -619,16 +619,21 @@ pub mod blockchain {
         authority: Pubkey,
     ) -> Result<MinerStats, ApiError> {
         if std::env::var("SIMULATE_ORE").unwrap_or_default() == "true" {
+            // Simulate win/loss based on round_id
+            let is_win = 12345 % 2 == 0; // For demo, round_id 12345 is odd, so loss
+            let rewards_sol = if is_win { 5.0 } else { 0.0 };
+            let rewards_ore = if is_win { 100.0 } else { 0.0 };
+
             return Ok(MinerStats {
                 address: "SimulatedMinerAddress".to_string(),
                 authority: authority.to_string(),
-                rewards_sol: 5.0,
-                rewards_ore: 100.0,
-                refined_ore: 50.0,
+                rewards_sol,
+                rewards_ore,
+                refined_ore: if is_win { 50.0 } else { 0.0 },
                 round_id: 12345,
                 checkpoint_id: 12344,
-                lifetime_rewards_sol: 25.0,
-                lifetime_rewards_ore: 500.0,
+                lifetime_rewards_sol: if is_win { 25.0 } else { 0.0 },
+                lifetime_rewards_ore: if is_win { 500.0 } else { 0.0 },
                 deployed: vec![1000; 25],
                 cumulative: vec![5000; 25],
             });
@@ -679,9 +684,9 @@ pub mod blockchain {
             return Ok(BoardInfo {
                 round_id: 12345,
                 start_slot: 1000,
-                end_slot: 2000,
-                current_slot: 1500,
-                time_remaining_sec: 500.0,
+                end_slot: 1150,
+                current_slot: 1075,
+                time_remaining_sec: 30.0,
             });
         }
 
