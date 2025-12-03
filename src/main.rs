@@ -2429,7 +2429,7 @@ async fn main() -> Result<(), anyhow::Error> {
         .connect(&config.database_url)
         .await?;
     
-    setup_database(&db).await?;
+    // setup_database(&db).await?;
     info!("Database connected and initialized");
 
     // Setup Redis
