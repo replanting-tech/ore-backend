@@ -260,6 +260,7 @@ pub fn start_update_broadcaster(state: Arc<AppState>) {
 
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(15));
         let mut counter = 0u64;
+        let mut last_round_id: Option<u64> = None;
 
         loop {
             interval.tick().await;
@@ -268,6 +269,18 @@ pub fn start_update_broadcaster(state: Arc<AppState>) {
             // Broadcast board updates (every 60 seconds, every 4 ticks)
             if counter % 4 == 0 {
                 if let Ok(board) = blockchain::get_board_info(&state.rpc_client).await {
+                    // Check if round changed
+                    if let Some(last) = last_round_id {
+                        if board.round_id != last {
+                            // Round has ended, update sessions for the previous round
+                            info!("Round {} ended, updating session results", last);
+                            if let Err(e) = update_round_results(&state, last).await {
+                                error!("Failed to update round results for round {}: {}", last, e);
+                            }
+                        }
+                    }
+                    last_round_id = Some(board.round_id);
+
                     let msg = WsMessage::BoardUpdate { board };
                     let _ = state.broadcast.send(msg);
                 } else {
@@ -379,6 +392,7 @@ pub struct MiningSession {
     pub rewards_ore: i64,
     pub claimed: bool,
     pub profitability: Option<String>, // "win", "loss", "breakeven", or null if not calculated
+    pub winning_square: Option<i32>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -424,6 +438,24 @@ pub struct BoardInfo {
     pub end_slot: u64,
     pub current_slot: u64,
     pub time_remaining_sec: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoundInfo {
+    pub address: String,
+    pub id: u64,
+    pub count: Vec<u64>,
+    pub deployed: Vec<u64>,
+    pub expires_at: u64,
+    pub motherlode: u64,
+    pub rent_payer: String,
+    pub slot_hash: Vec<u8>,
+    pub top_miner: String,
+    pub top_miner_reward: u64,
+    pub total_deployed: u64,
+    pub total_vaulted: u64,
+    pub total_winnings: u64,
+    pub winning_square: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -619,8 +651,17 @@ pub mod blockchain {
         authority: Pubkey,
     ) -> Result<MinerStats, ApiError> {
         if std::env::var("SIMULATE_ORE").unwrap_or_default() == "true" {
-            // Simulate win/loss based on round_id
-            let is_win = 12345 % 2 == 0; // For demo, round_id 12345 is odd, so loss
+            use std::time::{SystemTime, UNIX_EPOCH};
+
+            // Get current simulated round
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let current_round_id = 12345 + (now / 60) as u64;
+
+            // Simulate win/loss based on round_id (even = win, odd = loss)
+            let is_win = current_round_id % 2 == 0;
             let rewards_sol = if is_win { 5.0 } else { 0.0 };
             let rewards_ore = if is_win { 100.0 } else { 0.0 };
 
@@ -630,8 +671,8 @@ pub mod blockchain {
                 rewards_sol,
                 rewards_ore,
                 refined_ore: if is_win { 50.0 } else { 0.0 },
-                round_id: 12345,
-                checkpoint_id: 12344,
+                round_id: current_round_id,
+                checkpoint_id: current_round_id.saturating_sub(1),
                 lifetime_rewards_sol: if is_win { 25.0 } else { 0.0 },
                 lifetime_rewards_ore: if is_win { 500.0 } else { 0.0 },
                 deployed: vec![1000; 25],
@@ -681,12 +722,31 @@ pub mod blockchain {
 
     pub async fn get_board_info(rpc: &RpcClient) -> Result<BoardInfo, ApiError> {
         if std::env::var("SIMULATE_ORE").unwrap_or_default() == "true" {
+            use std::time::{SystemTime, UNIX_EPOCH};
+
+            // Simulate round progression based on current time
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+
+            // Each round lasts 60 seconds, base round_id on time
+            let round_id = 12345 + (now / 60) as u64;
+            let round_start_time = (now / 60) * 60;
+            let elapsed_in_round = now - round_start_time;
+
+            // Calculate slots (0.4 sec per slot)
+            let start_slot = 1000 + (round_id - 12345) * 150;
+            let end_slot = start_slot + 150;
+            let current_slot = start_slot + (elapsed_in_round as f64 * 2.5) as u64; // 2.5 slots per second
+            let time_remaining_sec = 60.0 - elapsed_in_round as f64;
+
             return Ok(BoardInfo {
-                round_id: 12345,
-                start_slot: 1000,
-                end_slot: 1150,
-                current_slot: 1075,
-                time_remaining_sec: 30.0,
+                round_id,
+                start_slot,
+                end_slot,
+                current_slot: current_slot.min(end_slot),
+                time_remaining_sec: time_remaining_sec.max(0.0),
             });
         }
 
@@ -738,6 +798,70 @@ pub mod blockchain {
                 end_slot: board.end_slot,
                 current_slot: clock.slot,
                 time_remaining_sec: time_remaining.max(0.0),
+            })
+        }).await
+    }
+
+    pub async fn get_round_info(rpc: &RpcClient, round_id: u64) -> Result<RoundInfo, ApiError> {
+        if std::env::var("SIMULATE_ORE").unwrap_or_default() == "true" {
+            // Simulate round info
+            return Ok(RoundInfo {
+                address: "SimulatedRoundAddress".to_string(),
+                id: round_id,
+                count: vec![10; 25],
+                deployed: vec![100000; 25],
+                expires_at: 1000000,
+                motherlode: 0,
+                rent_payer: "SimulatedRentPayer".to_string(),
+                slot_hash: vec![0; 32],
+                top_miner: "SimulatedTopMiner".to_string(),
+                top_miner_reward: 1000000000,
+                total_deployed: 2500000,
+                total_vaulted: 250000,
+                total_winnings: 2250000,
+                winning_square: 12,
+            });
+        }
+
+        with_rpc_retry(|| async {
+            let round_pda = ore_api::state::round_pda(round_id);
+            let account = match rpc.get_account(&round_pda.0).await {
+                Ok(account) => account,
+                Err(e) => {
+                    if e.to_string().contains("AccountNotFound") {
+                        return Err(ApiError::NotFound);
+                    }
+                    return Err(ApiError::Rpc(e));
+                }
+            };
+
+            let round_size = std::mem::size_of::<ore_api::state::Round>();
+            if account.data.len() < 8 + round_size {
+                return Err(ApiError::Internal("Round account data too small".to_string()));
+            }
+            let round_data = &account.data[8..8 + round_size];
+
+            let round = bytemuck::try_from_bytes::<ore_api::state::Round>(round_data)
+                .map_err(|e| ApiError::Internal(format!("Failed to parse round: {:?}", e)))?;
+
+            // Calculate winning square from slot hash
+            let winning_square = (round.slot_hash[0] as usize) % 25;
+
+            Ok(RoundInfo {
+                address: round_pda.0.to_string(),
+                id: round.id,
+                count: round.count.to_vec(),
+                deployed: round.deployed.to_vec(),
+                expires_at: round.expires_at,
+                motherlode: round.motherlode,
+                rent_payer: round.rent_payer.to_string(),
+                slot_hash: round.slot_hash.to_vec(),
+                top_miner: round.top_miner.to_string(),
+                top_miner_reward: round.top_miner_reward,
+                total_deployed: round.total_deployed,
+                total_vaulted: round.total_vaulted,
+                total_winnings: round.total_winnings,
+                winning_square,
             })
         }).await
     }
@@ -1116,6 +1240,7 @@ pub async fn setup_database(pool: &PgPool) -> Result<(), sqlx::Error> {
             rewards_ore BIGINT DEFAULT 0,
             claimed BOOLEAN DEFAULT FALSE,
             profitability VARCHAR(20), -- "win", "loss", "breakeven", or null
+            winning_square INTEGER,
             created_at TIMESTAMPTZ DEFAULT NOW(),
             updated_at TIMESTAMPTZ DEFAULT NOW()
         );
@@ -1190,6 +1315,14 @@ async fn get_board(State(state): State<Arc<AppState>>) -> Result<Json<BoardInfo>
     Ok(Json(board))
 }
 
+async fn get_round(
+    State(state): State<Arc<AppState>>,
+    Path(round_id): Path<u64>,
+) -> Result<Json<RoundInfo>, ApiError> {
+    let round = blockchain::get_round_info(&state.rpc_client, round_id).await?;
+    Ok(Json(round))
+}
+
 async fn get_treasury(State(state): State<Arc<AppState>>) -> Result<Json<TreasuryInfo>, ApiError> {
     let treasury = blockchain::get_treasury_info(&state.rpc_client).await?;
     Ok(Json(treasury))
@@ -1229,17 +1362,37 @@ async fn get_user_sessions(
 
     // Calculate profitability for sessions that don't have it set
     for session in &mut sessions {
-        if session.profitability.is_none() && session.rewards_sol > 0 {
-            session.profitability = Some(calculate_profitability(session.deployed_amount, session.rewards_sol));
+        if session.profitability.is_none() {
+            // Get round info if winning_square not set
+            if session.winning_square.is_none() {
+                if let Ok(round_info) = blockchain::get_round_info(&state.rpc_client, session.round_id as u64).await {
+                    session.winning_square = Some(round_info.winning_square as i32);
+                    // Update winning_square in db
+                    sqlx::query(
+                        "UPDATE mining_sessions SET winning_square = $1, updated_at = NOW() WHERE id = $2"
+                    )
+                    .bind(session.winning_square)
+                    .bind(session.id)
+                    .execute(&state.db)
+                    .await?;
+                }
+            }
 
-            // Update in database
-            sqlx::query(
-                "UPDATE mining_sessions SET profitability = $1, updated_at = NOW() WHERE id = $2"
-            )
-            .bind(&session.profitability)
-            .bind(session.id)
-            .execute(&state.db)
-            .await?;
+            // Calculate profitability based on winning square
+            if let Some(winning_square) = session.winning_square {
+                let user_squares: Vec<i32> = session.squares.iter().map(|&s| s as i32).collect();
+                let won = user_squares.contains(&winning_square);
+                session.profitability = Some(if won { "win".to_string() } else { "loss".to_string() });
+
+                // Update in database
+                sqlx::query(
+                    "UPDATE mining_sessions SET profitability = $1, updated_at = NOW() WHERE id = $2"
+                )
+                .bind(&session.profitability)
+                .bind(session.id)
+                .execute(&state.db)
+                .await?;
+            }
         }
     }
 
@@ -1353,14 +1506,15 @@ async fn deploy(
     sqlx::query(
         r#"
         INSERT INTO mining_sessions (
-            user_id, round_id, deployed_amount, squares, status
-        ) VALUES ($1, $2, $3, $4, 'active')
+            user_id, round_id, deployed_amount, squares, status, winning_square
+        ) VALUES ($1, $2, $3, $4, 'active', $5)
         "#
     )
     .bind(user.id)
     .bind(board.round_id as i64)
     .bind(amount_lamports as i64)
     .bind(&squares)
+    .bind(None::<i32>)
     .execute(&state.db)
     .await?;
     info!("Mining session created successfully");
@@ -1687,6 +1841,13 @@ async fn start_martingale(
     .fetch_one(&state.db)
     .await?;
 
+    // Try initial deploy immediately
+    if let Ok(board) = blockchain::get_board_info(&state.rpc_client).await {
+        if strategy.last_round_id != Some(board.round_id as i64) && strategy.current_round < strategy.rounds {
+            let _ = deploy_for_round(&state, &strategy, board.round_id).await;
+        }
+    }
+
     // Start the background task
     let state_clone = state.clone();
     let strategy_id = strategy.id;
@@ -1817,21 +1978,69 @@ async fn process_round_result(
         }
     };
 
-    // Calculate profitability if not already done
-    let profitability = if let Some(p) = &session.profitability {
-        p.clone()
-    } else {
-        let p = calculate_profitability(session.deployed_amount, session.rewards_sol);
-        // Update session
-        sqlx::query(
-            "UPDATE mining_sessions SET profitability = $1, updated_at = NOW() WHERE id = $2"
-        )
-        .bind(&p)
-        .bind(session.id)
-        .execute(&state.db)
-        .await?;
-        p
+    // Get round info to determine winning square
+    let round_info = match blockchain::get_round_info(&state.rpc_client, round_id).await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("Failed to get round info for round {}: {}", round_id, e);
+            return Ok(());
+        }
     };
+
+    // Update session with winning square
+    sqlx::query(
+        "UPDATE mining_sessions SET winning_square = $1, updated_at = NOW() WHERE id = $2"
+    )
+    .bind(round_info.winning_square as i32)
+    .bind(session.id)
+    .execute(&state.db)
+    .await?;
+
+    // Check if user won (deployed to winning square)
+    let user_squares: Vec<usize> = session.squares.iter().map(|&s| s as usize).collect();
+    let won = user_squares.contains(&round_info.winning_square);
+
+    // Get user wallet for miner stats
+    let user: User = sqlx::query_as::<_, User>(
+        "SELECT * FROM users WHERE id = $1"
+    )
+    .bind(strategy.user_id)
+    .fetch_one(&state.db)
+    .await?;
+
+    let pubkey: solana_sdk::pubkey::Pubkey = user.wallet_address.parse()
+        .map_err(|_| ApiError::Internal("Invalid wallet address".to_string()))?;
+
+    // Get current miner rewards to update the session
+    let miner_stats = blockchain::get_miner_stats(&state.rpc_client, pubkey).await?;
+    let current_rewards_sol = (miner_stats.rewards_sol * blockchain::LAMPORTS_PER_SOL as f64) as i64;
+    let current_rewards_ore = miner_stats.rewards_ore as i64;
+
+    // Update session with current rewards
+    sqlx::query(
+        "UPDATE mining_sessions SET rewards_sol = $1, rewards_ore = $2, updated_at = NOW() WHERE id = $3"
+    )
+    .bind(current_rewards_sol)
+    .bind(current_rewards_ore)
+    .bind(session.id)
+    .execute(&state.db)
+    .await?;
+
+    // Calculate profitability based on win/loss
+    let profitability = if won {
+        "win"
+    } else {
+        "loss"
+    }.to_string();
+
+    // Update session profitability
+    sqlx::query(
+        "UPDATE mining_sessions SET profitability = $1, updated_at = NOW() WHERE id = $2"
+    )
+    .bind(&profitability)
+    .bind(session.id)
+    .execute(&state.db)
+    .await?;
 
     let deployed_sol = session.deployed_amount as f64 / blockchain::LAMPORTS_PER_SOL as f64;
     let rewards_sol = session.rewards_sol as f64 / blockchain::LAMPORTS_PER_SOL as f64;
@@ -1938,14 +2147,15 @@ async fn deploy_for_round(
     sqlx::query(
         r#"
         INSERT INTO mining_sessions (
-            user_id, round_id, deployed_amount, squares, status
-        ) VALUES ($1, $2, $3, $4, 'active')
+            user_id, round_id, deployed_amount, squares, status, winning_square
+        ) VALUES ($1, $2, $3, $4, 'active', $5)
         "#
     )
     .bind(strategy.user_id)
     .bind(round_id as i64)
     .bind(amount_lamports as i64)
     .bind(vec![0i32,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24]) // all squares
+    .bind(None::<i32>)
     .execute(&state.db)
     .await?;
 
@@ -1959,6 +2169,47 @@ async fn deploy_for_round(
     .await?;
 
     info!("Deployed {} SOL for strategy {} in round {}", strategy.current_amount_sol, strategy.id, round_id);
+
+    Ok(())
+}
+
+async fn update_round_results(state: &Arc<AppState>, round_id: u64) -> Result<(), ApiError> {
+    // Get round info
+    let round_info = blockchain::get_round_info(&state.rpc_client, round_id).await?;
+
+    // Find all mining sessions for this round that don't have winning_square set
+    let sessions: Vec<MiningSession> = sqlx::query_as::<_, MiningSession>(
+        "SELECT * FROM mining_sessions WHERE round_id = $1 AND winning_square IS NULL"
+    )
+    .bind(round_id as i64)
+    .fetch_all(&state.db)
+    .await?;
+
+    for session in sessions {
+        // Update winning_square
+        sqlx::query(
+            "UPDATE mining_sessions SET winning_square = $1, updated_at = NOW() WHERE id = $2"
+        )
+        .bind(round_info.winning_square as i32)
+        .bind(session.id)
+        .execute(&state.db)
+        .await?;
+
+        // Calculate profitability
+        let user_squares: Vec<i32> = session.squares.iter().map(|&s| s as i32).collect();
+        let won = user_squares.contains(&(round_info.winning_square as i32));
+        let profitability = if won { "win" } else { "loss" };
+
+        sqlx::query(
+            "UPDATE mining_sessions SET profitability = $1, updated_at = NOW() WHERE id = $2"
+        )
+        .bind(profitability)
+        .bind(session.id)
+        .execute(&state.db)
+        .await?;
+
+        info!("Updated session {} for round {}: won={}, profitability={}", session.id, round_id, won, profitability);
+    }
 
     Ok(())
 }
@@ -2027,17 +2278,37 @@ async fn deployment_history(
 
     // Calculate profitability for sessions that don't have it set
     for session in &mut sessions {
-        if session.profitability.is_none() && session.rewards_sol > 0 {
-            session.profitability = Some(calculate_profitability(session.deployed_amount, session.rewards_sol));
+        if session.profitability.is_none() {
+            // Get round info if winning_square not set
+            if session.winning_square.is_none() {
+                if let Ok(round_info) = blockchain::get_round_info(&state.rpc_client, session.round_id as u64).await {
+                    session.winning_square = Some(round_info.winning_square as i32);
+                    // Update winning_square in db
+                    sqlx::query(
+                        "UPDATE mining_sessions SET winning_square = $1, updated_at = NOW() WHERE id = $2"
+                    )
+                    .bind(session.winning_square)
+                    .bind(session.id)
+                    .execute(&state.db)
+                    .await?;
+                }
+            }
 
-            // Update in database
-            sqlx::query(
-                "UPDATE mining_sessions SET profitability = $1, updated_at = NOW() WHERE id = $2"
-            )
-            .bind(&session.profitability)
-            .bind(session.id)
-            .execute(&state.db)
-            .await?;
+            // Calculate profitability based on winning square
+            if let Some(winning_square) = session.winning_square {
+                let user_squares: Vec<i32> = session.squares.iter().map(|&s| s as i32).collect();
+                let won = user_squares.contains(&winning_square);
+                session.profitability = Some(if won { "win".to_string() } else { "loss".to_string() });
+
+                // Update in database
+                sqlx::query(
+                    "UPDATE mining_sessions SET profitability = $1, updated_at = NOW() WHERE id = $2"
+                )
+                .bind(&session.profitability)
+                .bind(session.id)
+                .execute(&state.db)
+                .await?;
+            }
         }
     }
 
@@ -2097,6 +2368,7 @@ fn create_router(state: Arc<AppState>) -> Router {
         .route("/health", get(health_check))
         .route("/ws", get(websocket_handler))  // NEW: WebSocket endpoint
         .route("/api/board", get(get_board))
+        .route("/api/round/:id", get(get_round))
         .route("/api/treasury", get(get_treasury))
         .route("/api/miner/:wallet", get(get_miner))
         .route("/api/miner/:wallet/sessions", get(get_user_sessions))
@@ -2157,7 +2429,7 @@ async fn main() -> Result<(), anyhow::Error> {
         .connect(&config.database_url)
         .await?;
     
-    // setup_database(&db).await?;
+    setup_database(&db).await?;
     info!("Database connected and initialized");
 
     // Setup Redis
@@ -2198,6 +2470,7 @@ async fn main() -> Result<(), anyhow::Error> {
     info!("   GET  /health");
     info!("   GET  /ws              <- WebSocket endpoint");
     info!("   GET  /api/board");
+    info!("   GET  /api/round/:id   <- Round information with winning square");
     info!("   GET  /api/treasury");
     info!("   GET  /api/miner/:wallet");
     info!("   GET  /api/miner/:wallet/sessions");

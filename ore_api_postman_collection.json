@@ -1,0 +1,240 @@
+{
+  "info": {
+    "name": "ORE Mining Backend API",
+    "description": "Complete API collection for ORE Mining Backend",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:3000",
+      "type": "string"
+    },
+    {
+      "key": "wallet",
+      "value": "11111111111111111111111111111112",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "Root",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/",
+          "host": ["{{base_url}}"],
+          "path": [""]
+        }
+      }
+    },
+    {
+      "name": "Health Check",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/health",
+          "host": ["{{base_url}}"],
+          "path": ["health"]
+        }
+      }
+    },
+    {
+      "name": "Get Board",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/api/board",
+          "host": ["{{base_url}}"],
+          "path": ["api", "board"]
+        }
+      }
+    },
+    {
+      "name": "Get Treasury",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/api/treasury",
+          "host": ["{{base_url}}"],
+          "path": ["api", "treasury"]
+        }
+      }
+    },
+    {
+      "name": "Get Miner Stats",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/api/miner/{{wallet}}",
+          "host": ["{{base_url}}"],
+          "path": ["api", "miner", "{{wallet}}"]
+        }
+      }
+    },
+    {
+      "name": "Get Miner Sessions",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/api/miner/{{wallet}}/sessions",
+          "host": ["{{base_url}}"],
+          "path": ["api", "miner", "{{wallet}}", "sessions"]
+        }
+      }
+    },
+    {
+      "name": "Get Miner History",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/api/miner/{{wallet}}/history",
+          "host": ["{{base_url}}"],
+          "path": ["api", "miner", "{{wallet}}", "history"]
+        }
+      }
+    },
+    {
+      "name": "Register User",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"wallet_address\": \"{{wallet}}\"\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/api/user/register",
+          "host": ["{{base_url}}"],
+          "path": ["api", "user", "register"]
+        }
+      }
+    },
+    {
+      "name": "Deploy ORE",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"wallet_address\": \"{{wallet}}\",\n  \"amount\": 1.0,\n  \"square_id\": null\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/api/deploy",
+          "host": ["{{base_url}}"],
+          "path": ["api", "deploy"]
+        }
+      }
+    },
+    {
+      "name": "Claim Rewards",
+      "request": {
+        "method": "POST",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/api/claim",
+          "host": ["{{base_url}}"],
+          "path": ["api", "claim"]
+        }
+      }
+    },
+    {
+      "name": "Checkpoint Miner",
+      "request": {
+        "method": "POST",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/api/checkpoint",
+          "host": ["{{base_url}}"],
+          "path": ["api", "checkpoint"]
+        }
+      }
+    },
+    {
+      "name": "Start Martingale",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"wallet_address\": \"{{wallet}}\",\n  \"rounds\": 10,\n  \"base_amount_sol\": 1.0,\n  \"loss_multiplier\": 2.0,\n  \"max_loss_sol\": 10.0\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/api/martingale/start",
+          "host": ["{{base_url}}"],
+          "path": ["api", "martingale", "start"]
+        }
+      }
+    },
+    {
+      "name": "Get Active Martingale",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/api/martingale/active/{{wallet}}",
+          "host": ["{{base_url}}"],
+          "path": ["api", "martingale", "active", "{{wallet}}"]
+        }
+      }
+    },
+    {
+      "name": "Get Martingale Progress",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/api/martingale/progress/{{wallet}}",
+          "host": ["{{base_url}}"],
+          "path": ["api", "martingale", "progress", "{{wallet}}"]
+        }
+      }
+    },
+    {
+      "name": "Get Active Mining Sessions",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/api/mining/active/{{wallet}}",
+          "host": ["{{base_url}}"],
+          "path": ["api", "mining", "active", "{{wallet}}"]
+        }
+      }
+    },
+    {
+      "name": "Get Global Stats",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/api/stats/global",
+          "host": ["{{base_url}}"],
+          "path": ["api", "stats", "global"]
+        }
+      }
+    }
+  ]
+}
