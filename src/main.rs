@@ -100,7 +100,7 @@ pub async fn websocket_handler(
         warn!("Max WebSocket connections reached: {}/{}", current_connections, state.max_connections);
         return axum::response::Response::builder()
             .status(StatusCode::SERVICE_UNAVAILABLE)
-            .body("Server at maximum capacity")
+            .body(axum::body::Body::from("Server at maximum capacity"))
             .unwrap();
     }
     
@@ -115,33 +115,28 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     
     let (mut sender, mut receiver) = socket.split();
     
-    // Create a scoped broadcast receiver that will be properly dropped
-    let mut rx = {
-        let mut subscribed_topics = Vec::new();
-        
-        // Subscribed topics for this client
-        let mut client_topics: Vec<String> = vec![];
-        
-        // Send initial connection message
-        let welcome = WsMessage::BoardUpdate {
-            board: blockchain::get_board_info(&state.rpc_client)
-                .await
-                .unwrap_or_else(|_| BoardInfo {
-                    round_id: 0,
-                    start_slot: 0,
-                    end_slot: 0,
-                    current_slot: 0,
-                    time_remaining_sec: 0.0,
-                }),
-        };
-        
-        if let Ok(msg) = serde_json::to_string(&welcome) {
-            let _ = sender.send(Message::Text(msg)).await;
-        }
-        
-        // Subscribe to broadcast
-        state.broadcast.subscribe()
+    // Subscribed topics for this client
+    let mut subscribed_topics: Vec<String> = vec![];
+    
+    // Subscribe to broadcast
+    let mut rx = state.broadcast.subscribe();
+    
+    // Send initial connection message
+    let welcome = WsMessage::BoardUpdate {
+        board: blockchain::get_board_info(&state.rpc_client)
+            .await
+            .unwrap_or_else(|_| BoardInfo {
+                round_id: 0,
+                start_slot: 0,
+                end_slot: 0,
+                current_slot: 0,
+                time_remaining_sec: 0.0,
+            }),
     };
+    
+    if let Ok(msg) = serde_json::to_string(&welcome) {
+        let _ = sender.send(Message::Text(msg)).await;
+    }
     
     // Handle incoming and outgoing messages with timeout
     loop {
@@ -156,11 +151,19 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                     match ws_msg {
                                         WsMessage::Subscribe { topic } => {
                                             info!("Client {} subscribed to: {}", connection_id, topic);
-                                            // Topic subscription logic here
+                                            if !subscribed_topics.contains(&topic) {
+                                                subscribed_topics.push(topic.clone());
+                                            }
+                                            
+                                            // Send initial data for the topic
+                                            let response = get_initial_data(&state, &topic).await;
+                                            if let Ok(msg) = serde_json::to_string(&response) {
+                                                let _ = sender.send(Message::Text(msg)).await;
+                                            }
                                         }
                                         WsMessage::Unsubscribe { topic } => {
                                             info!("Client {} unsubscribed from: {}", connection_id, topic);
-                                            // Topic unsubscription logic here
+                                            subscribed_topics.retain(|t| t != &topic);
                                         }
                                         WsMessage::Ping => {
                                             if let Ok(msg) = serde_json::to_string(&WsMessage::Pong) {
@@ -198,12 +201,16 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
             result = tokio::time::timeout(Duration::from_secs(60), rx.recv()) => {
                 match result {
                     Ok(Ok(broadcast_msg)) => {
-                        // Filter and send broadcast messages
+                        // Filter based on subscribed topics
                         let should_send = match &broadcast_msg {
-                            WsMessage::BoardUpdate { .. } => true,
-                            WsMessage::TreasuryUpdate { .. } => true,
-                            WsMessage::SquaresUpdate { .. } => true,
-                            WsMessage::RoundComplete { .. } => true,
+                            WsMessage::BoardUpdate { .. } => subscribed_topics.contains(&"board".to_string()),
+                            WsMessage::TreasuryUpdate { .. } => subscribed_topics.contains(&"treasury".to_string()),
+                            WsMessage::SquaresUpdate { .. } => subscribed_topics.contains(&"squares".to_string()),
+                            WsMessage::RoundComplete { .. } => true, // Always send round complete
+                            WsMessage::MinerUpdate { wallet, .. } => {
+                                subscribed_topics.contains(&format!("miner:{}", wallet)) ||
+                                subscribed_topics.contains(&"miners".to_string())
+                            }
                             _ => false,
                         };
                         
@@ -300,7 +307,7 @@ pub fn start_update_broadcaster(state: Arc<AppState>) {
                     match client.get_connection_manager().await {
                         Ok(conn) => {
                             redis_client = Some(conn);
-                            redis_retry_count = 0;
+                            let _ = redis_retry_count; // Suppress unused variable warning
                             break;
                         }
                         Err(e) => {
