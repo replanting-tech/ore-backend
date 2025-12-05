@@ -2449,6 +2449,7 @@ async fn deployment_history(
                 "rewards_ore": s.rewards_ore,
                 "claimed": s.claimed,
                 "profitability": s.profitability,
+                "winning_square": s.winning_square,
                 "created_at": s.created_at,
                 "updated_at": s.updated_at
             })
