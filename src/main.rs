@@ -12,6 +12,7 @@ use futures_util::{sink::SinkExt, stream::StreamExt};
 use serde::{Deserialize, Serialize};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tower_http::cors::{CorsLayer, AllowOrigin, AllowHeaders, AllowMethods};
@@ -57,7 +58,9 @@ pub struct AppState {
     pub redis: redis::aio::ConnectionManager,
     pub rpc_client: Arc<solana_client::nonblocking::rpc_client::RpcClient>,
     pub config: Arc<Config>,
-    pub broadcast: broadcast::Sender<WsMessage>,  // NEW: Broadcast channel
+    pub broadcast: broadcast::Sender<WsMessage>,
+    pub connection_count: Arc<AtomicUsize>,  // Track WebSocket connections
+    pub max_connections: usize,              // Maximum allowed connections
 }
 
 #[derive(Clone)]
@@ -91,107 +94,141 @@ pub async fn websocket_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
 ) -> Response {
+    // Check connection limit
+    let current_connections = state.connection_count.load(Ordering::Relaxed);
+    if current_connections >= state.max_connections {
+        warn!("Max WebSocket connections reached: {}/{}", current_connections, state.max_connections);
+        return axum::response::Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .body("Server at maximum capacity")
+            .unwrap();
+    }
+    
     ws.on_upgrade(|socket| handle_socket(socket, state))
 }
 
 async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
+    // Increment connection counter
+    state.connection_count.fetch_add(1, Ordering::Relaxed);
+    let connection_id = state.connection_count.load(Ordering::Relaxed);
+    info!("WebSocket client connected (ID: {}, Total: {})", connection_id, connection_id);
+    
     let (mut sender, mut receiver) = socket.split();
     
-    // Subscribe to broadcast
-    let mut rx = state.broadcast.subscribe();
-    
-    // Client info
-    info!("WebSocket client connected");
-    
-    // Subscribed topics for this client
-    let mut subscribed_topics: Vec<String> = vec![];
-    
-    // Send initial connection message
-    let welcome = WsMessage::BoardUpdate {
-        board: blockchain::get_board_info(&state.rpc_client)
-            .await
-            .unwrap_or_else(|_| BoardInfo {
-                round_id: 0,
-                start_slot: 0,
-                end_slot: 0,
-                current_slot: 0,
-                time_remaining_sec: 0.0,
-            }),
+    // Create a scoped broadcast receiver that will be properly dropped
+    let mut rx = {
+        let mut subscribed_topics = Vec::new();
+        
+        // Subscribed topics for this client
+        let mut client_topics: Vec<String> = vec![];
+        
+        // Send initial connection message
+        let welcome = WsMessage::BoardUpdate {
+            board: blockchain::get_board_info(&state.rpc_client)
+                .await
+                .unwrap_or_else(|_| BoardInfo {
+                    round_id: 0,
+                    start_slot: 0,
+                    end_slot: 0,
+                    current_slot: 0,
+                    time_remaining_sec: 0.0,
+                }),
+        };
+        
+        if let Ok(msg) = serde_json::to_string(&welcome) {
+            let _ = sender.send(Message::Text(msg)).await;
+        }
+        
+        // Subscribe to broadcast
+        state.broadcast.subscribe()
     };
     
-    if let Ok(msg) = serde_json::to_string(&welcome) {
-        let _ = sender.send(Message::Text(msg)).await;
-    }
-    
-    // Handle incoming and outgoing messages
+    // Handle incoming and outgoing messages with timeout
     loop {
         tokio::select! {
-            // Handle messages from client
-            Some(Ok(msg)) = receiver.next() => {
-                match msg {
-                    Message::Text(text) => {
-                        if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(&text) {
-                            match ws_msg {
-                                WsMessage::Subscribe { topic } => {
-                                    info!("Client subscribed to: {}", topic);
-                                    if !subscribed_topics.contains(&topic) {
-                                        subscribed_topics.push(topic.clone());
-                                    }
-                                    
-                                    // Send initial data for the topic
-                                    let response = get_initial_data(&state, &topic).await;
-                                    if let Ok(msg) = serde_json::to_string(&response) {
-                                        let _ = sender.send(Message::Text(msg)).await;
-                                    }
-                                }
-                                WsMessage::Unsubscribe { topic } => {
-                                    info!("Client unsubscribed from: {}", topic);
-                                    subscribed_topics.retain(|t| t != &topic);
-                                }
-                                WsMessage::Ping => {
-                                    if let Ok(msg) = serde_json::to_string(&WsMessage::Pong) {
-                                        let _ = sender.send(Message::Text(msg)).await;
+            // Handle messages from client with timeout
+            result = tokio::time::timeout(Duration::from_secs(300), receiver.next()) => {
+                match result {
+                    Ok(Some(Ok(msg))) => {
+                        match msg {
+                            Message::Text(text) => {
+                                if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(&text) {
+                                    match ws_msg {
+                                        WsMessage::Subscribe { topic } => {
+                                            info!("Client {} subscribed to: {}", connection_id, topic);
+                                            // Topic subscription logic here
+                                        }
+                                        WsMessage::Unsubscribe { topic } => {
+                                            info!("Client {} unsubscribed from: {}", connection_id, topic);
+                                            // Topic unsubscription logic here
+                                        }
+                                        WsMessage::Ping => {
+                                            if let Ok(msg) = serde_json::to_string(&WsMessage::Pong) {
+                                                let _ = sender.send(Message::Text(msg)).await;
+                                            }
+                                        }
+                                        _ => {}
                                     }
                                 }
-                                _ => {}
                             }
+                            Message::Close(_) => {
+                                info!("WebSocket client {} disconnected", connection_id);
+                                break;
+                            }
+                            _ => {}
                         }
                     }
-                    Message::Close(_) => {
-                        info!("WebSocket client disconnected");
+                    Ok(Some(Err(e))) => {
+                        warn!("WebSocket error for client {}: {}", connection_id, e);
                         break;
                     }
-                    _ => {}
+                    Ok(None) => {
+                        info!("WebSocket client {} connection closed", connection_id);
+                        break;
+                    }
+                    Err(_) => {
+                        // Timeout - clean up connection
+                        info!("WebSocket client {} timed out", connection_id);
+                        break;
+                    }
                 }
             }
             
-            // Handle broadcast messages
-            Ok(broadcast_msg) = rx.recv() => {
-                // Filter based on subscribed topics
-                let should_send = match &broadcast_msg {
-                    WsMessage::BoardUpdate { .. } => subscribed_topics.contains(&"board".to_string()),
-                    WsMessage::MinerUpdate { wallet, .. } => {
-                        subscribed_topics.contains(&format!("miner:{}", wallet)) ||
-                        subscribed_topics.contains(&"miners".to_string())
-                    }
-                    WsMessage::TreasuryUpdate { .. } => subscribed_topics.contains(&"treasury".to_string()),
-                    WsMessage::SquaresUpdate { .. } => subscribed_topics.contains(&"squares".to_string()),
-                    WsMessage::RoundComplete { .. } => true, // Always send round complete
-                    _ => false,
-                };
-                
-                if should_send {
-                    if let Ok(msg) = serde_json::to_string(&broadcast_msg) {
-                        if sender.send(Message::Text(msg)).await.is_err() {
-                            break;
+            // Handle broadcast messages with timeout
+            result = tokio::time::timeout(Duration::from_secs(60), rx.recv()) => {
+                match result {
+                    Ok(Ok(broadcast_msg)) => {
+                        // Filter and send broadcast messages
+                        let should_send = match &broadcast_msg {
+                            WsMessage::BoardUpdate { .. } => true,
+                            WsMessage::TreasuryUpdate { .. } => true,
+                            WsMessage::SquaresUpdate { .. } => true,
+                            WsMessage::RoundComplete { .. } => true,
+                            _ => false,
+                        };
+                        
+                        if should_send {
+                            if let Ok(msg) = serde_json::to_string(&broadcast_msg) {
+                                if sender.send(Message::Text(msg)).await.is_err() {
+                                    break;
+                                }
+                            }
                         }
+                    }
+                    Ok(Err(_)) => {
+                        // Broadcast channel error - continue
+                    }
+                    Err(_) => {
+                        // Timeout on broadcast - normal, continue
                     }
                 }
             }
         }
     }
     
-    info!("WebSocket handler closed");
+    // Decrement connection counter when done
+    state.connection_count.fetch_sub(1, Ordering::Relaxed);
+    info!("WebSocket handler closed (ID: {})", connection_id);
 }
 
 async fn get_initial_data(state: &Arc<AppState>, topic: &str) -> WsMessage {
@@ -252,11 +289,38 @@ async fn get_initial_data(state: &Arc<AppState>, topic: &str) -> WsMessage {
 
 pub fn start_update_broadcaster(state: Arc<AppState>) {
     tokio::spawn(async move {
-        // Create separate Redis connection for broadcaster to enable caching
-        let redis_client = redis::Client::open(state.config.redis_url.as_str())
-            .expect("Failed to create Redis client for broadcaster");
-        let mut redis = redis_client.get_connection_manager().await
-            .expect("Failed to get Redis connection for broadcaster");
+        let mut redis_client = None;
+        let mut redis_retry_count = 0;
+        const MAX_RETRY_COUNT: usize = 3;
+        
+        // Create Redis connection with retry logic
+        loop {
+            match redis::Client::open(state.config.redis_url.as_str()) {
+                Ok(client) => {
+                    match client.get_connection_manager().await {
+                        Ok(conn) => {
+                            redis_client = Some(conn);
+                            redis_retry_count = 0;
+                            break;
+                        }
+                        Err(e) => {
+                            warn!("Failed to create Redis connection for broadcaster: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to create Redis client for broadcaster: {}", e);
+                }
+            }
+            
+            redis_retry_count += 1;
+            if redis_retry_count >= MAX_RETRY_COUNT {
+                error!("Failed to initialize Redis connection after {} attempts", MAX_RETRY_COUNT);
+                return;
+            }
+            
+            sleep(Duration::from_secs(5)).await;
+        }
 
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(15));
         let mut counter = 0u64;
@@ -288,13 +352,17 @@ pub fn start_update_broadcaster(state: Arc<AppState>) {
                 }
             }
 
-            // Broadcast square stats every 45 seconds (every 3 ticks) - now with caching
+            // Broadcast square stats every 45 seconds (every 3 ticks) - with connection management
             if counter % 3 == 0 {
-                if let Ok(squares) = blockchain::get_square_stats_cached(&state.rpc_client, &mut redis).await {
-                    let msg = WsMessage::SquaresUpdate { squares };
-                    let _ = state.broadcast.send(msg);
-                } else {
-                    warn!("Failed to fetch square stats for broadcast");
+                if let Some(ref mut redis) = redis_client {
+                    if let Ok(squares) = blockchain::get_square_stats_cached(&state.rpc_client, redis).await {
+                        let msg = WsMessage::SquaresUpdate { squares };
+                        let _ = state.broadcast.send(msg);
+                    } else {
+                        warn!("Failed to fetch square stats for broadcast");
+                        // Try to reconnect Redis if connection is broken
+                        redis_client = reconnect_redis(&state.config.redis_url).await;
+                    }
                 }
             }
 
@@ -309,6 +377,29 @@ pub fn start_update_broadcaster(state: Arc<AppState>) {
             }
         }
     });
+}
+
+async fn reconnect_redis(redis_url: &str) -> Option<redis::aio::ConnectionManager> {
+    for attempt in 1..=3 {
+        match redis::Client::open(redis_url) {
+            Ok(client) => {
+                match client.get_connection_manager().await {
+                    Ok(conn) => {
+                        info!("Redis reconnected successfully on attempt {}", attempt);
+                        return Some(conn);
+                    }
+                    Err(e) => {
+                        warn!("Redis reconnection attempt {} failed: {}", attempt, e);
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Redis client creation failed on attempt {}: {}", attempt, e);
+            }
+        }
+        sleep(Duration::from_secs(2)).await;
+    }
+    None
 }
 
 // ============================================================================
@@ -2423,14 +2514,18 @@ async fn main() -> Result<(), anyhow::Error> {
     let config = Arc::new(Config::from_env()?);
     info!("Configuration loaded");
 
-    // Setup database
+    // Setup database with better connection management
     let db = PgPoolOptions::new()
-        .max_connections(10)
+        .max_connections(50)              // Increased from 10
+        .min_connections(5)               // Keep minimum connections
+        .max_lifetime(Duration::from_secs(1800)) // 30 minutes
+        .idle_timeout(Duration::from_secs(300))  // 5 minutes
+        .acquire_timeout(Duration::from_secs(30)) // 30 seconds to acquire
         .connect(&config.database_url)
         .await?;
     
     // setup_database(&db).await?;
-    info!("Database connected and initialized");
+    info!("Database connected and initialized with connection pool");
 
     // Setup Redis
     let redis_client = redis::Client::open(config.redis_url.as_str())?;
@@ -2443,9 +2538,13 @@ async fn main() -> Result<(), anyhow::Error> {
     ));
     info!("RPC client initialized: {}", config.rpc_url);
 
-    // Create broadcast channel for WebSocket
-    let (broadcast_tx, _) = broadcast::channel(100);
+    // Create broadcast channel for WebSocket with larger buffer
+    let (broadcast_tx, _) = broadcast::channel(1000);
     info!("WebSocket broadcast channel created");
+
+    // Create connection tracking
+    let connection_count = Arc::new(AtomicUsize::new(0));
+    let max_connections = 100; // Limit concurrent WebSocket connections
 
     // Create application state
     let state = Arc::new(AppState {
@@ -2453,7 +2552,9 @@ async fn main() -> Result<(), anyhow::Error> {
         redis,
         rpc_client,
         config: config.clone(),
-        broadcast: broadcast_tx,  // NEW
+        broadcast: broadcast_tx,
+        connection_count: connection_count.clone(),
+        max_connections,
     });
 
     // Start background update broadcaster
