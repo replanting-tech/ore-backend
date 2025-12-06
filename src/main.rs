@@ -1174,8 +1174,13 @@ pub mod blockchain {
     
             let board_pda = ore_api::state::board_pda();
             let account = rpc.get_account(&board_pda.0).await?;
-            let board = ore_api::state::Board::try_from_bytes(&account.data)
-                .map_err(|_| ApiError::Internal("Failed to parse board".into()))?;
+            let board_size = std::mem::size_of::<ore_api::state::Board>();
+            if account.data.len() < 8 + board_size {
+                return Err(ApiError::Internal("Board account data too small".to_string()));
+            }
+            let board_data = &account.data[8..8 + board_size];
+            let board = bytemuck::try_from_bytes::<ore_api::state::Board>(board_data)
+                .map_err(|e| ApiError::Internal(format!("Failed to parse board: {:?}", e)))?;
     
             // Setup squares berdasarkan square_ids
             let squares = if let Some(ids) = square_ids {
@@ -1643,7 +1648,7 @@ async fn deploy(
     info!("Deploy transaction successful: signature={}", signature);
 
     // Create mining session record
-    let squares = if let Some(ids) = &payload.square_ids {
+    let squares: Vec<i32> = if let Some(ids) = &payload.square_ids {
         ids.iter().map(|&id| id as i32).collect()
     } else {
         (0..25).collect() // All squares if no specific squares
