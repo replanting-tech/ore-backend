@@ -578,8 +578,8 @@ pub struct SquareStats {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DeployRequest {
     pub wallet_address: String,
-    pub amount: f64,
-    pub square_id: Option<u64>,
+    pub amount: u64,
+    pub square_ids: Option<Vec<u64>>,  // UBAH: terima array
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1159,11 +1159,62 @@ pub mod blockchain {
 
         let signature = rpc.send_and_confirm_transaction(&tx).await?;
         info!("Deploy transaction: {}", signature);
-        
+    
         Ok(signature.to_string())
     }
-
-    pub async fn claim_rewards(
+    
+        pub async fn deploy_ore_multiple(
+            rpc: &RpcClient,
+            keypair_path: &str,
+            amount: u64,
+            square_ids: Option<Vec<u64>>,
+        ) -> Result<String, ApiError> {
+            let payer = read_keypair_file(keypair_path)
+                .map_err(|e| ApiError::BadRequest(format!("Keypair error: {}", e)))?;
+    
+            let board_pda = ore_api::state::board_pda();
+            let account = rpc.get_account(&board_pda.0).await?;
+            let board = ore_api::state::Board::try_from_bytes(&account.data)
+                .map_err(|_| ApiError::Internal("Failed to parse board".into()))?;
+    
+            // Setup squares berdasarkan square_ids
+            let squares = if let Some(ids) = square_ids {
+                let mut s = [false; 25];
+                for id in ids {
+                    if id < 25 {
+                        s[id as usize] = true;
+                    }
+                }
+                s
+            } else {
+                [true; 25]  // Default: semua squares
+            };
+    
+            // TETAP 1 instruksi saja
+            let ix = ore_api::sdk::deploy(
+                payer.pubkey(),
+                payer.pubkey(),
+                amount,
+                board.round_id,
+                squares,
+            );
+    
+            let compute_limit = ComputeBudgetInstruction::set_compute_unit_limit(1_400_000);
+            let compute_price = ComputeBudgetInstruction::set_compute_unit_price(1_000_000);
+    
+            let blockhash = rpc.get_latest_blockhash().await?;
+            let tx = Transaction::new_signed_with_payer(
+                &[compute_limit, compute_price, ix],
+                Some(&payer.pubkey()),
+                &[&payer],
+                blockhash,
+            );
+    
+            let signature = rpc.send_and_confirm_transaction(&tx).await?;
+            Ok(signature.to_string())
+        }
+    
+        pub async fn claim_rewards(
         rpc: &RpcClient,
         keypair_path: &str,
     ) -> Result<ClaimResponse, ApiError> {
@@ -1548,12 +1599,8 @@ async fn deploy(
         return Err(ApiError::BadRequest("Invalid wallet address: must be exactly 44 characters".into()));
     }
 
-    info!("Deploy request received: wallet={}, amount={} SOL, square_id={:?}",
-          payload.wallet_address, payload.amount, payload.square_id);
-
-    // Convert amount from SOL to lamports
-    let amount_lamports = (payload.amount * blockchain::LAMPORTS_PER_SOL as f64) as u64;
-    info!("Converted amount: {} SOL = {} lamports", payload.amount, amount_lamports);
+    info!("Deploy request received: wallet={}, amount={} lamports, square_ids={:?}",
+          payload.wallet_address, payload.amount, payload.square_ids);
 
     // Get or create user
     info!("Getting or creating user for wallet: {}", payload.wallet_address);
@@ -1578,12 +1625,12 @@ async fn deploy(
     info!("Checkpoint completed: signature={}", checkpoint_signature);
 
     // Perform blockchain deployment
-    info!("Performing blockchain deploy: amount={} lamports, square_id={:?}", amount_lamports, payload.square_id);
-    let signature = match blockchain::deploy_ore(
+    info!("Performing blockchain deploy: amount={} lamports, square_ids={:?}", payload.amount, payload.square_ids);
+    let signature = match blockchain::deploy_ore_multiple(
         &state.rpc_client,
         &state.config.keypair_path,
-        amount_lamports,
-        payload.square_id,
+        payload.amount,
+        payload.square_ids.clone(),
     )
     .await {
         Ok(sig) => sig,
@@ -1596,13 +1643,13 @@ async fn deploy(
     info!("Deploy transaction successful: signature={}", signature);
 
     // Create mining session record
-    let squares = if let Some(square_id) = payload.square_id {
-        vec![square_id as i32]
+    let squares = if let Some(ids) = &payload.square_ids {
+        ids.iter().map(|&id| id as i32).collect()
     } else {
-        (0..25).collect() // All squares if no specific square
+        (0..25).collect() // All squares if no specific squares
     };
     info!("Creating mining session record: user_id={}, round_id={}, deployed_amount={}, squares={:?}",
-          user.id, board.round_id, amount_lamports, squares);
+          user.id, board.round_id, payload.amount, squares);
 
     sqlx::query(
         r#"
@@ -1613,7 +1660,7 @@ async fn deploy(
     )
     .bind(user.id)
     .bind(board.round_id as i64)
-    .bind(amount_lamports as i64)
+    .bind(payload.amount as i64)
     .bind(&squares)
     .bind(None::<i32>)
     .execute(&state.db)
@@ -1624,7 +1671,7 @@ async fn deploy(
         "success": true,
         "signature": signature,
         "amount": payload.amount,
-        "square": payload.square_id,
+        "squares": payload.square_ids,
         "user_id": user.id
     });
     info!("Deploy request completed successfully: {:?}", response);
