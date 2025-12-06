@@ -499,6 +499,7 @@ pub struct MiningSession {
 pub struct MartingaleStrategy {
     pub id: uuid::Uuid,
     pub user_id: uuid::Uuid,
+    pub wallet_address: String,
     pub rounds: i32,
     pub base_amount_sol: f64,
     pub loss_multiplier: f64,
@@ -1346,6 +1347,7 @@ pub async fn setup_database(pool: &PgPool) -> Result<(), sqlx::Error> {
         CREATE TABLE IF NOT EXISTS martingale_strategies (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             user_id UUID NOT NULL REFERENCES users(id),
+            wallet_address VARCHAR(44) NOT NULL,
             rounds INTEGER NOT NULL,
             base_amount_sol DOUBLE PRECISION NOT NULL,
             loss_multiplier DOUBLE PRECISION NOT NULL,
@@ -1364,6 +1366,7 @@ pub async fn setup_database(pool: &PgPool) -> Result<(), sqlx::Error> {
         CREATE INDEX IF NOT EXISTS idx_sessions_user ON mining_sessions(user_id);
         CREATE INDEX IF NOT EXISTS idx_sessions_round ON mining_sessions(round_id);
         CREATE INDEX IF NOT EXISTS idx_martingale_user ON martingale_strategies(user_id);
+        CREATE INDEX IF NOT EXISTS idx_martingale_wallet_address ON martingale_strategies(wallet_address);
         CREATE INDEX IF NOT EXISTS idx_martingale_status ON martingale_strategies(status);
         "#,
     )
@@ -1666,10 +1669,9 @@ async fn get_active_martingale(
 
     let strategy: Option<MartingaleStrategy> = sqlx::query_as::<_, MartingaleStrategy>(
         r#"
-        SELECT ms.* FROM martingale_strategies ms
-        JOIN users u ON ms.user_id = u.id
-        WHERE u.wallet_address = $1 AND ms.status = 'active'
-        ORDER BY ms.created_at DESC
+        SELECT * FROM martingale_strategies
+        WHERE wallet_address = $1
+        ORDER BY created_at DESC
         LIMIT 1
         "#
     )
@@ -1764,10 +1766,9 @@ async fn get_martingale_progress(
     // Get active strategy
     let strategy: Option<MartingaleStrategy> = sqlx::query_as::<_, MartingaleStrategy>(
         r#"
-        SELECT ms.* FROM martingale_strategies ms
-        JOIN users u ON ms.user_id = u.id
-        WHERE u.wallet_address = $1 AND ms.status = 'active'
-        ORDER BY ms.created_at DESC
+        SELECT * FROM martingale_strategies
+        WHERE wallet_address = $1 AND status = 'active'
+        ORDER BY created_at DESC
         LIMIT 1
         "#
     )
@@ -1910,9 +1911,9 @@ async fn start_martingale(
 
     // Check if user already has an active strategy
     let existing: Option<MartingaleStrategy> = sqlx::query_as::<_, MartingaleStrategy>(
-        "SELECT * FROM martingale_strategies WHERE user_id = $1 AND status = 'active'"
+        "SELECT * FROM martingale_strategies WHERE wallet_address = $1 AND status = 'active'"
     )
-    .bind(user.id)
+    .bind(&payload.wallet_address)
     .fetch_optional(&state.db)
     .await?;
 
@@ -1924,13 +1925,14 @@ async fn start_martingale(
     let strategy: MartingaleStrategy = sqlx::query_as::<_, MartingaleStrategy>(
         r#"
         INSERT INTO martingale_strategies (
-            user_id, rounds, base_amount_sol, loss_multiplier, max_loss_sol,
+            user_id, wallet_address, rounds, base_amount_sol, loss_multiplier, max_loss_sol,
             current_amount_sol
-        ) VALUES ($1, $2, $3, $4, $5, $6)
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7)
         RETURNING *
         "#
     )
     .bind(user.id)
+    .bind(&payload.wallet_address)
     .bind(payload.rounds)
     .bind(payload.base_amount_sol)
     .bind(payload.loss_multiplier)
@@ -2529,6 +2531,7 @@ async fn main() -> Result<(), anyhow::Error> {
         .max_lifetime(Duration::from_secs(1800)) // 30 minutes
         .idle_timeout(Duration::from_secs(300))  // 5 minutes
         .acquire_timeout(Duration::from_secs(30)) // 30 seconds to acquire
+        .test_before_acquire(true)        // Test connections before acquiring to prevent cached plan issues
         .connect(&config.database_url)
         .await?;
     
