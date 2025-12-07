@@ -203,33 +203,47 @@ curl -X POST http://localhost:3000/api/user/register \
 ---
 
 ### POST /api/deploy
-**Description:** Deploy ORE
+**Description:** Deploy ORE to one or multiple squares
 
 **Request:** JSON (DeployRequest)
 ```json
 {
   "wallet_address": "44-character-wallet-address",
-  "amount": 1.0,
-  "square_id": null
+  "amount": 1000000000,
+  "square_ids": [3, 5, 7]
 }
 ```
+
+**Parameters:**
+- `wallet_address`: Wallet address (44 characters)
+- `amount`: Amount in lamports (u64)
+- `square_ids`: Array of square IDs to deploy to (optional, deploys to all 25 squares if not provided)
 
 **Response:** JSON
 ```json
 {
   "success": true,
   "signature": "TransactionSignature...",
-  "amount": 1.0,
-  "square": null,
+  "amount": 1000000000,
+  "squares": [3, 5, 7],
   "user_id": "uuid"
 }
 ```
 
-**Curl:**
+**Curl Examples:**
+
+Deploy to specific squares:
 ```bash
 curl -X POST http://localhost:3000/api/deploy \
   -H "Content-Type: application/json" \
-  -d '{"wallet_address":"44-character-wallet-address","amount":1.0,"square_id":null}'
+  -d '{"wallet_address":"44-character-wallet-address","amount":1000000000,"square_ids":[3,5,7]}'
+```
+
+Deploy to all squares:
+```bash
+curl -X POST http://localhost:3000/api/deploy \
+  -H "Content-Type: application/json" \
+  -d '{"wallet_address":"44-character-wallet-address","amount":1000000000}'
 ```
 
 ---

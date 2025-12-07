@@ -182,7 +182,12 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                         }
                     }
                     Ok(Some(Err(e))) => {
-                        warn!("WebSocket error for client {}: {}", connection_id, e);
+                        let error_msg = e.to_string();
+                        if error_msg.contains("Connection reset without closing handshake") {
+                            info!("WebSocket client {} disconnected (connection reset)", connection_id);
+                        } else {
+                            warn!("WebSocket error for client {}: {}", connection_id, e);
+                        }
                         break;
                     }
                     Ok(None) => {
