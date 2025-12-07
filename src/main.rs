@@ -789,9 +789,21 @@ pub mod blockchain {
             let account = match rpc.get_account(&miner_pda.0).await {
                 Ok(account) => account,
                 Err(e) => {
-                    // Handle account not found - this is expected for miners that haven't been created yet
+                    // Handle account not found - auto-register by returning default stats
                     if e.to_string().contains("AccountNotFound") {
-                        return Err(ApiError::NotFound);
+                        return Ok(MinerStats {
+                            address: miner_pda.0.to_string(),
+                            authority: authority.to_string(),
+                            rewards_sol: 0.0,
+                            rewards_ore: 0.0,
+                            refined_ore: 0.0,
+                            round_id: 0,
+                            checkpoint_id: 0,
+                            lifetime_rewards_sol: 0.0,
+                            lifetime_rewards_ore: 0.0,
+                            deployed: vec![0; 25],
+                            cumulative: vec![0; 25],
+                        });
                     }
                     return Err(ApiError::Rpc(e));
                 }
@@ -1494,13 +1506,18 @@ async fn get_miner(
     State(state): State<Arc<AppState>>,
     Path(wallet): Path<String>,
 ) -> Result<Json<MinerStats>, ApiError> {
-    // GANTI baris ini:
-    // let pubkey = solana_sdk::pubkey::Pubkey::from_str(&wallet)
-    
-    // DENGAN ini:
+    // Validate wallet address length
+    if wallet.len() != 44 {
+        return Err(ApiError::BadRequest("Invalid wallet address: must be exactly 44 characters".into()));
+    }
+
+    // Auto-register user in database
+    let _user = get_or_create_user(&state.db, &wallet).await?;
+
+    // Parse wallet address
     let pubkey: solana_sdk::pubkey::Pubkey = wallet.parse()
         .map_err(|_| ApiError::BadRequest("Invalid wallet address".into()))?;
-    
+
     let stats = blockchain::get_miner_stats(&state.rpc_client, pubkey).await?;
     Ok(Json(stats))
 }
