@@ -1317,25 +1317,66 @@ pub mod blockchain {
         let payer = read_keypair_file(keypair_path)
             .map_err(|e| ApiError::BadRequest(format!("Keypair error: {}", e)))?;
 
-        // Create register instruction
-        let ix = ore_api::instruction::register(payer.pubkey());
+        // Check if miner account already exists
+        let miner_address = ore_api::state::miner_pda(payer.pubkey()).0;
+        
+        match rpc.get_account(&miner_address).await {
+            Ok(_) => {
+                info!("Miner account already exists at: {}", miner_address);
+                return Ok(format!("Miner already registered: {}", miner_address));
+            }
+            Err(_) => {
+                // Miner doesn't exist yet
+                info!("Miner account doesn't exist yet, will be created on first transaction");
+                
+                // The miner account will be automatically created when they first deploy
+                // You can create it now by doing a minimal deploy transaction
+                let board = get_board(rpc).await
+                    .map_err(|e| ApiError::Internal(format!("Failed to get board: {}", e)))?;
+                
+                // Deploy minimal amount to initialize miner account
+                let minimal_amount = 1_000_000; // 0.001 ORE
+                let squares = [false; 25]; // Don't deploy to any square
+                
+                let ix = ore_api::sdk::deploy(
+                    payer.pubkey(),
+                    payer.pubkey(),
+                    minimal_amount,
+                    board.round_id,
+                    squares,
+                );
 
-        // Add compute budget
-        let compute_limit = ComputeBudgetInstruction::set_compute_unit_limit(1_400_000);
-        let compute_price = ComputeBudgetInstruction::set_compute_unit_price(1_000_000);
+                // Add compute budget
+                let compute_limit = ComputeBudgetInstruction::set_compute_unit_limit(1_400_000);
+                let compute_price = ComputeBudgetInstruction::set_compute_unit_price(1_000_000);
 
-        let blockhash = rpc.get_latest_blockhash().await?;
-        let tx = Transaction::new_signed_with_payer(
-            &[compute_limit, compute_price, ix],
-            Some(&payer.pubkey()),
-            &[&payer],
-            blockhash,
-        );
+                let blockhash = rpc.get_latest_blockhash().await?;
+                let tx = Transaction::new_signed_with_payer(
+                    &[compute_limit, compute_price, ix],
+                    Some(&payer.pubkey()),
+                    &[&payer],
+                    blockhash,
+                );
 
-        let signature = rpc.send_and_confirm_transaction(&tx).await?;
-        info!("Register miner transaction: {}", signature);
+                let signature = rpc.send_and_confirm_transaction(&tx).await?;
+                info!("Initialized miner account with transaction: {}", signature);
 
-        Ok(signature.to_string())
+                Ok(signature.to_string())
+            }
+        }
+    }
+
+    async fn get_board(rpc: &RpcClient) -> Result<ore_api::state::Board, ApiError> {
+        use steel::AccountDeserialize;
+        
+        let board_pda = ore_api::state::board_pda();
+        let account = rpc.get_account(&board_pda.0).await
+            .map_err(|e| ApiError::Internal(format!("Failed to get board account: {}", e)))?;
+        
+        let board = ore_api::state::Board::try_from_bytes(&account.data)
+            .map_err(|e| ApiError::Internal(format!("Failed to deserialize board: {}", e)))?;
+        
+        Ok(*board)
     }
 
     pub async fn checkpoint_miner(
