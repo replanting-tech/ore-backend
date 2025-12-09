@@ -1354,20 +1354,7 @@ pub mod blockchain {
 
         // Get miner info
         let miner_pda = ore_api::state::miner_pda(authority);
-        let account = match rpc.get_account(&miner_pda.0).await {
-            Ok(account) => account,
-            Err(e) => {
-                if e.to_string().contains("AccountNotFound") {
-                    // Miner not registered, register first
-                    info!("Miner account not found, registering miner first");
-                    register_miner(rpc, keypair_path).await?;
-                    // Now get the account again
-                    rpc.get_account(&miner_pda.0).await?
-                } else {
-                    return Err(ApiError::Rpc(e));
-                }
-            }
-        };
+        let account = rpc.get_account(&miner_pda.0).await?;
 
         let miner_size = std::mem::size_of::<ore_api::state::Miner>();
         if account.data.len() < 8 + miner_size {
@@ -1710,17 +1697,38 @@ async fn deploy(
     let board = blockchain::get_board_info(&state.rpc_client).await?;
     info!("Board info: round_id={}, current_slot={}", board.round_id, board.current_slot);
 
-    // Ensure miner is checkpointed before deploying
-    info!("Checkpointing miner before deploy");
-    let checkpoint_signature = match blockchain::checkpoint_miner(&state.rpc_client, &state.config.keypair_path, None).await {
-        Ok(sig) => sig,
-        Err(ApiError::Rpc(e)) => {
-            error!("Checkpoint before deploy failed: {}", e);
-            return Err(handle_transaction_rpc_error(&e));
+    // Check if miner account exists before checkpointing
+    let miner_pda = ore_api::state::miner_pda(state.config.keypair_path.parse::<solana_sdk::pubkey::Pubkey>().unwrap_or_default());
+    let miner_exists = match state.rpc_client.get_account(&miner_pda.0).await {
+        Ok(_) => true,
+        Err(e) => {
+            if e.to_string().contains("AccountNotFound") {
+                info!("Miner account not found, skipping checkpoint");
+                false
+            } else {
+                error!("Error checking miner account: {}", e);
+                return Err(ApiError::Rpc(e));
+            }
         }
-        Err(other) => return Err(other),
     };
-    info!("Checkpoint completed: signature={}", checkpoint_signature);
+
+    let checkpoint_signature = if miner_exists {
+        info!("Checkpointing miner before deploy");
+        match blockchain::checkpoint_miner(&state.rpc_client, &state.config.keypair_path, None).await {
+            Ok(sig) => {
+                info!("Checkpoint completed: signature={}", sig);
+                Some(sig)
+            }
+            Err(ApiError::Rpc(e)) => {
+                error!("Checkpoint before deploy failed: {}", e);
+                return Err(handle_transaction_rpc_error(&e));
+            }
+            Err(other) => return Err(other),
+        }
+    } else {
+        info!("Skipping checkpoint - miner account doesn't exist yet");
+        None
+    };
 
     // Perform blockchain deployment
     info!("Performing blockchain deploy: amount={} lamports, square_ids={:?}", payload.amount, payload.square_ids);
