@@ -2781,7 +2781,7 @@ async fn main() -> Result<(), anyhow::Error> {
     info!("   GET  /api/martingale/active/:wallet");
     info!("   GET  /api/martingale/progress/:wallet");
     info!("   GET  /api/mining/active/:wallet");
-    info!("   GET  /api/stats/global");
+    info!("   GET  /api/stats/global"); 
     info!("   POST /api/user/burner-address");
 
     axum::serve(listener, app).await?;
