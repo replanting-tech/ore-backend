@@ -1318,7 +1318,7 @@ pub mod blockchain {
             .map_err(|e| ApiError::BadRequest(format!("Keypair error: {}", e)))?;
 
         // Create register instruction
-        let ix = ore_api::sdk::register(payer.pubkey());
+        let ix = ore_api::instruction::register(payer.pubkey());
 
         // Add compute budget
         let compute_limit = ComputeBudgetInstruction::set_compute_unit_limit(1_400_000);
