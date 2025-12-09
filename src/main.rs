@@ -479,6 +479,7 @@ pub struct User {
     pub id: uuid::Uuid,
     pub wallet_address: String,
     pub email: Option<String>,
+    pub burner_address: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -594,6 +595,12 @@ pub struct StartMartingaleRequest {
     pub base_amount_sol: f64,
     pub loss_multiplier: f64,
     pub max_loss_sol: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UpdateBurnerWalletRequest {
+    pub wallet_address: String,
+    pub burner_wallet: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1397,6 +1404,7 @@ pub async fn setup_database(pool: &PgPool) -> Result<(), sqlx::Error> {
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             wallet_address VARCHAR(44) UNIQUE NOT NULL,
             email VARCHAR(255),
+            burner_wallet VARCHAR(44),
             created_at TIMESTAMPTZ DEFAULT NOW(),
             updated_at TIMESTAMPTZ DEFAULT NOW()
         );
@@ -2533,6 +2541,40 @@ async fn deployment_history(
     })))
 }
 
+async fn update_burner_wallet(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<UpdateBurnerWalletRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    // Validate wallet addresses
+    if payload.wallet_address.len() != 44 {
+        return Err(ApiError::BadRequest("Invalid main wallet address format".into()));
+    }
+    if payload.burner_wallet.len() != 44 {
+        return Err(ApiError::BadRequest("Invalid burner wallet address format".into()));
+    }
+
+    // Update the burner_address for the user
+    let rows_affected = sqlx::query(
+        "UPDATE users SET burner_address = $1, updated_at = NOW() WHERE wallet_address = $2"
+    )
+    .bind(&payload.burner_address)
+    .bind(&payload.wallet_address)
+    .execute(&state.db)
+    .await?
+    .rows_affected();
+
+    if rows_affected == 0 {
+        return Err(ApiError::NotFound);
+    }
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "message": "Burner address updated successfully",
+        "wallet_address": payload.wallet_address,
+        "burner_address": payload.burner_address
+    })))
+}
+
 // ============================================================================
 // Router
 // ============================================================================
@@ -2557,6 +2599,7 @@ fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/martingale/progress/:wallet", get(get_martingale_progress))
         .route("/api/stats/global", get(global_stats))
         .route("/api/miner/:wallet/history", get(deployment_history))
+        .route("/api/user/burner-address", post(update_burner_wallet))
         .layer(
             CorsLayer::new()
                 .allow_origin(AllowOrigin::any())
@@ -2670,6 +2713,7 @@ async fn main() -> Result<(), anyhow::Error> {
     info!("   GET  /api/martingale/progress/:wallet");
     info!("   GET  /api/mining/active/:wallet");
     info!("   GET  /api/stats/global");
+    info!("   POST /api/user/burner-address");
 
     axum::serve(listener, app).await?;
 
