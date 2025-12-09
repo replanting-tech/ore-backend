@@ -301,10 +301,10 @@ async fn get_initial_data(state: &Arc<AppState>, topic: &str) -> WsMessage {
 
 pub fn start_update_broadcaster(state: Arc<AppState>) {
     tokio::spawn(async move {
-        let mut redis_client = None;
+        let mut redis_client;
         let mut redis_retry_count = 0;
         const MAX_RETRY_COUNT: usize = 3;
-        
+
         // Create Redis connection with retry logic
         loop {
             match redis::Client::open(state.config.redis_url.as_str()) {
@@ -324,13 +324,13 @@ pub fn start_update_broadcaster(state: Arc<AppState>) {
                     warn!("Failed to create Redis client for broadcaster: {}", e);
                 }
             }
-            
+
             redis_retry_count += 1;
             if redis_retry_count >= MAX_RETRY_COUNT {
                 error!("Failed to initialize Redis connection after {} attempts", MAX_RETRY_COUNT);
                 return;
             }
-            
+
             sleep(Duration::from_secs(5)).await;
         }
 
@@ -2549,7 +2549,7 @@ async fn update_burner_wallet(
     if payload.wallet_address.len() != 44 {
         return Err(ApiError::BadRequest("Invalid main wallet address format".into()));
     }
-    if payload.burner_wallet.len() != 44 {
+    if payload.burner_address.len() != 44 {
         return Err(ApiError::BadRequest("Invalid burner wallet address format".into()));
     }
 
