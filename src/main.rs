@@ -1712,12 +1712,11 @@ async fn deploy(
         }
     };
 
-    let checkpoint_signature = if miner_exists {
+    if miner_exists {
         info!("Checkpointing miner before deploy");
         match blockchain::checkpoint_miner(&state.rpc_client, &state.config.keypair_path, None).await {
             Ok(sig) => {
                 info!("Checkpoint completed: signature={}", sig);
-                Some(sig)
             }
             Err(ApiError::Rpc(e)) => {
                 error!("Checkpoint before deploy failed: {}", e);
@@ -1727,8 +1726,7 @@ async fn deploy(
         }
     } else {
         info!("Skipping checkpoint - miner account doesn't exist yet");
-        None
-    };
+    }
 
     // Perform blockchain deployment
     info!("Performing blockchain deploy: amount={} lamports, square_ids={:?}", payload.amount, payload.square_ids);
