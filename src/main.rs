@@ -1306,6 +1306,38 @@ pub mod blockchain {
         })
     }
 
+    pub async fn register_miner(
+        rpc: &RpcClient,
+        keypair_path: &str,
+    ) -> Result<String, ApiError> {
+        if std::env::var("SIMULATE_ORE").unwrap_or_default() == "true" {
+            return Ok("SimulatedRegisterSignature1234567890abcdef".to_string());
+        }
+
+        let payer = read_keypair_file(keypair_path)
+            .map_err(|e| ApiError::BadRequest(format!("Keypair error: {}", e)))?;
+
+        // Create register instruction
+        let ix = ore_api::sdk::register(payer.pubkey());
+
+        // Add compute budget
+        let compute_limit = ComputeBudgetInstruction::set_compute_unit_limit(1_400_000);
+        let compute_price = ComputeBudgetInstruction::set_compute_unit_price(1_000_000);
+
+        let blockhash = rpc.get_latest_blockhash().await?;
+        let tx = Transaction::new_signed_with_payer(
+            &[compute_limit, compute_price, ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            blockhash,
+        );
+
+        let signature = rpc.send_and_confirm_transaction(&tx).await?;
+        info!("Register miner transaction: {}", signature);
+
+        Ok(signature.to_string())
+    }
+
     pub async fn checkpoint_miner(
         rpc: &RpcClient,
         keypair_path: &str,
@@ -1322,7 +1354,21 @@ pub mod blockchain {
 
         // Get miner info
         let miner_pda = ore_api::state::miner_pda(authority);
-        let account = rpc.get_account(&miner_pda.0).await?;
+        let account = match rpc.get_account(&miner_pda.0).await {
+            Ok(account) => account,
+            Err(e) => {
+                if e.to_string().contains("AccountNotFound") {
+                    // Miner not registered, register first
+                    info!("Miner account not found, registering miner first");
+                    register_miner(rpc, keypair_path).await?;
+                    // Now get the account again
+                    rpc.get_account(&miner_pda.0).await?
+                } else {
+                    return Err(ApiError::Rpc(e));
+                }
+            }
+        };
+
         let miner_size = std::mem::size_of::<ore_api::state::Miner>();
         if account.data.len() < 8 + miner_size {
             return Err(ApiError::Internal("Miner account data too small".to_string()));
