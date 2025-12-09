@@ -525,6 +525,7 @@ pub struct MartingaleStrategy {
 pub struct MinerStats {
     pub address: String,
     pub authority: String,
+    pub balance_sol: f64,
     pub rewards_sol: f64,
     pub rewards_ore: f64,
     pub refined_ore: f64,
@@ -779,6 +780,7 @@ pub mod blockchain {
             return Ok(MinerStats {
                 address: "SimulatedMinerAddress".to_string(),
                 authority: authority.to_string(),
+                balance_sol: 25.0, // Simulated wallet balance
                 rewards_sol,
                 rewards_ore,
                 refined_ore: if is_win { 50.0 } else { 0.0 },
@@ -792,6 +794,19 @@ pub mod blockchain {
         }
 
         with_rpc_retry(|| async {
+            // Get wallet balance first
+            let balance = rpc.get_balance(&authority).await
+                .map_err(|e| {
+                    // If account doesn't exist, return balance as 0
+                    if e.to_string().contains("AccountNotFound") {
+                        ApiError::Internal("Wallet account not found on blockchain".to_string())
+                    } else {
+                        ApiError::Rpc(e)
+                    }
+                })?;
+
+            let balance_sol = (balance as f64) / LAMPORTS_PER_SOL as f64;
+
             let miner_pda = ore_api::state::miner_pda(authority);
             let account = match rpc.get_account(&miner_pda.0).await {
                 Ok(account) => account,
@@ -801,6 +816,7 @@ pub mod blockchain {
                         return Ok(MinerStats {
                             address: miner_pda.0.to_string(),
                             authority: authority.to_string(),
+                            balance_sol,
                             rewards_sol: 0.0,
                             rewards_ore: 0.0,
                             refined_ore: 0.0,
@@ -830,6 +846,7 @@ pub mod blockchain {
             Ok(MinerStats {
                 address: miner_pda.0.to_string(),
                 authority: authority.to_string(),
+                balance_sol,
                 rewards_sol: (miner.rewards_sol as f64) / LAMPORTS_PER_SOL as f64,
                 rewards_ore: amount_to_ui(miner.rewards_ore),
                 refined_ore: amount_to_ui(miner.refined_ore),
