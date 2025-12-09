@@ -600,7 +600,7 @@ pub struct StartMartingaleRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UpdateBurnerWalletRequest {
     pub wallet_address: String,
-    pub burner_wallet: String,
+    pub burner_address: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
