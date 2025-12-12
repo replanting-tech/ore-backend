@@ -1163,7 +1163,7 @@ pub mod blockchain {
 
         let mut instructions = vec![];
 
-        // Check if miner needs checkpoint
+        // Check if miner needs checkpoint and add auto-checkpoint
         let miner_address = ore_api::state::miner_pda(payer.pubkey()).0;
         match rpc.get_account(&miner_address).await {
             Ok(account) => {
@@ -1173,7 +1173,7 @@ pub mod blockchain {
                 
                 // If miner hasn't checkpointed for their last round, do it now
                 if miner.checkpoint_id < miner.round_id {
-                    info!("Miner needs checkpoint: checkpoint_id={}, round_id={}", 
+                    info!("Miner needs checkpoint: checkpoint_id={}, round_id={}",
                         miner.checkpoint_id, miner.round_id);
                     
                     let checkpoint_ix = ore_api::sdk::checkpoint(
@@ -1182,10 +1182,12 @@ pub mod blockchain {
                         miner.round_id,
                     );
                     instructions.push(checkpoint_ix);
+                } else {
+                    info!("Miner already checkpointed for round {}, skipping checkpoint", miner.round_id);
                 }
             }
             Err(_) => {
-                info!("Miner account doesn't exist yet, will be created");
+                info!("Miner account doesn't exist yet, will be created - no checkpoint needed");
             }
         }
 
@@ -1334,6 +1336,109 @@ pub mod blockchain {
         
         info!("Deploy transaction confirmed: {}", signature);
         Ok(signature.to_string())
+    }
+
+    // Enhanced deploy function with automatic blockhash refresh to prevent "Blockhash not found" errors
+    pub async fn deploy_ore_with_auto_retry(
+        rpc: &RpcClient,
+        keypair_path: &str,
+        amount: u64,
+        square_ids: Option<Vec<u64>>,
+        priority_fee_microlamports: u64,
+    ) -> Result<String, ApiError> {
+        if std::env::var("SIMULATE_ORE").unwrap_or_default() == "true" {
+            return Ok("SimulatedAutoDeploySignature1234567890abcdef".to_string());
+        }
+
+        let payer = read_keypair_file(keypair_path)
+            .map_err(|e| ApiError::BadRequest(format!("Keypair error: {}", e)))?;
+
+        let board_pda = ore_api::state::board_pda();
+        let account = rpc.get_account(&board_pda.0).await?;
+        let board_size = std::mem::size_of::<ore_api::state::Board>();
+        if account.data.len() < 8 + board_size {
+            return Err(ApiError::Internal("Board account data too small".to_string()));
+        }
+        let board_data = &account.data[8..8 + board_size];
+        let board = bytemuck::try_from_bytes::<ore_api::state::Board>(board_data)
+            .map_err(|e| ApiError::Internal(format!("Failed to parse board: {:?}", e)))?;
+
+        // Setup squares berdasarkan square_ids
+        let squares = if let Some(ids) = square_ids {
+            let mut s = [false; 25];
+            for id in ids {
+                if id >= 25 {
+                    return Err(ApiError::BadRequest(format!("Invalid square ID: {}. Must be 0-24", id)));
+                }
+                s[id as usize] = true;
+            }
+            // Ensure at least one square is selected
+            if !s.iter().any(|&x| x) {
+                return Err(ApiError::BadRequest("At least one square must be selected".to_string()));
+            }
+            s
+        } else {
+            [true; 25]  // Default: semua squares
+        };
+
+        info!("Auto-retry deploying {} lamports to squares: {:?}", amount, squares.iter().enumerate().filter(|(_, &x)| x).map(|(i, _)| i).collect::<Vec<_>>());
+
+        // Create deploy instruction
+        let ix = ore_api::sdk::deploy(
+            payer.pubkey(),
+            payer.pubkey(),
+            amount,
+            board.round_id,
+            squares,
+        );
+
+        // Add compute budget with priority fee support
+        let compute_limit = ComputeBudgetInstruction::set_compute_unit_limit(1_400_000);
+        let compute_price = ComputeBudgetInstruction::set_compute_unit_price(priority_fee_microlamports);
+
+        // Retry logic for blockhash issues
+        let mut attempts = 0;
+        let max_attempts = 3;
+
+        loop {
+            attempts += 1;
+            
+            // Get fresh blockhash for each attempt
+            let blockhash = rpc.get_latest_blockhash().await
+                .map_err(|e| ApiError::Internal(format!("Failed to get fresh blockhash: {}", e)))?;
+
+            let tx = Transaction::new_signed_with_payer(
+                &[compute_limit.clone(), compute_price.clone(), ix.clone()],
+                Some(&payer.pubkey()),
+                &[&payer],
+                blockhash,
+            );
+
+            info!("Auto-retry deploy attempt {} with priority fee: {} microlamports", attempts, priority_fee_microlamports);
+            
+            match rpc.send_and_confirm_transaction(&tx).await {
+                Ok(signature) => {
+                    info!("Auto-retry deploy transaction confirmed on attempt {}: {}", attempts, signature);
+                    return Ok(signature.to_string());
+                }
+                Err(e) => {
+                    let error_msg = e.to_string();
+                    
+                    // Check if it's a blockhash error and we have more attempts
+                    if (error_msg.contains("BlockhashNotFound") || error_msg.contains("blockhash not found")) && attempts < max_attempts {
+                        warn!("Blockhash expired on deploy attempt {}, retrying with fresh blockhash (attempt {}/{})",
+                              attempts - 1, attempts, max_attempts);
+                        
+                        // Short delay before retry
+                        sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                    
+                    error!("Auto-retry deploy transaction failed after {} attempts: {}", attempts, error_msg);
+                    return Err(ApiError::Internal(format!("Auto-retry deploy failed: {}", e)));
+                }
+            }
+        }
     }
 
         pub async fn claim_rewards(
@@ -1510,6 +1615,102 @@ pub mod blockchain {
         info!("Checkpoint transaction successful: {}", signature);
 
         Ok(signature.to_string())
+    }
+
+    // Auto checkpoint with blockhash refresh to prevent "Blockhash not found" errors
+    pub async fn auto_checkpoint_miner(
+        rpc: &RpcClient,
+        keypair_path: &str,
+        authority: Option<Pubkey>,
+    ) -> Result<String, ApiError> {
+        if std::env::var("SIMULATE_ORE").unwrap_or_default() == "true" {
+            return Ok("SimulatedAutoCheckpointSignature1234567890abcdef".to_string());
+        }
+
+        let payer = read_keypair_file(keypair_path)
+            .map_err(|e| ApiError::BadRequest(format!("Keypair error: {}", e)))?;
+
+        let authority = authority.unwrap_or(payer.pubkey());
+
+        info!("Auto-checkpointing miner for authority: {}", authority);
+
+        // Get miner info
+        let miner_pda = ore_api::state::miner_pda(authority);
+        let account = match rpc.get_account(&miner_pda.0).await {
+            Ok(account) => account,
+            Err(e) => {
+                if e.to_string().contains("AccountNotFound") {
+                    info!("Miner account not found for authority: {}, skipping checkpoint", authority);
+                    return Ok(format!("No miner account: {}", miner_pda.0));
+                }
+                return Err(ApiError::Rpc(e));
+            }
+        };
+
+        let miner_size = std::mem::size_of::<ore_api::state::Miner>();
+        if account.data.len() < 8 + miner_size {
+            return Err(ApiError::Internal("Miner account data too small".to_string()));
+        }
+        let miner_data = &account.data[8..8 + miner_size];
+        let miner = bytemuck::try_from_bytes::<ore_api::state::Miner>(miner_data)
+            .map_err(|e| ApiError::Internal(format!("Failed to parse miner: {:?}", e)))?;
+
+        // Check if checkpoint is needed
+        if miner.checkpoint_id >= miner.round_id {
+            info!("Miner already checkpointed for round {}, skipping auto-checkpoint", miner.round_id);
+            return Ok(format!("Already checkpointed: {}", miner_pda.0));
+        }
+
+        info!("Auto-checkpointing for round {} (current checkpoint: {})", miner.round_id, miner.checkpoint_id);
+
+        // Retry logic for blockhash issues
+        let mut attempts = 0;
+        let max_attempts = 3;
+
+        loop {
+            attempts += 1;
+            
+            // Create checkpoint instruction
+            let ix = ore_api::sdk::checkpoint(payer.pubkey(), authority, miner.round_id);
+
+            // Add compute budget
+            let compute_limit = ComputeBudgetInstruction::set_compute_unit_limit(1_400_000);
+            let compute_price = ComputeBudgetInstruction::set_compute_unit_price(1_000_000);
+
+            // Get fresh blockhash for each attempt
+            let blockhash = rpc.get_latest_blockhash().await
+                .map_err(|e| ApiError::Internal(format!("Failed to get fresh blockhash: {}", e)))?;
+
+            let tx = Transaction::new_signed_with_payer(
+                &[compute_limit, compute_price, ix],
+                Some(&payer.pubkey()),
+                &[&payer],
+                blockhash,
+            );
+
+            match rpc.send_and_confirm_transaction(&tx).await {
+                Ok(signature) => {
+                    info!("Auto-checkpoint transaction successful on attempt {}: {}", attempts, signature);
+                    return Ok(signature.to_string());
+                }
+                Err(e) => {
+                    let error_msg = e.to_string();
+                    
+                    // Check if it's a blockhash error and we have more attempts
+                    if (error_msg.contains("BlockhashNotFound") || error_msg.contains("blockhash not found")) && attempts < max_attempts {
+                        warn!("Blockhash expired on attempt {}, retrying with fresh blockhash (attempt {}/{})",
+                              attempts - 1, attempts, max_attempts);
+                        
+                        // Short delay before retry
+                        sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                    
+                    error!("Auto-checkpoint transaction failed after {} attempts: {}", attempts, error_msg);
+                    return Err(ApiError::Internal(format!("Auto-checkpoint failed: {}", e)));
+                }
+            }
+        }
     }
 
     async fn count_participants_in_square(
@@ -1844,13 +2045,13 @@ async fn deploy(
     };
 
     if miner_exists {
-        info!("Checkpointing miner before deploy for wallet: {}", payload.wallet_address);
-        match blockchain::checkpoint_miner(&state.rpc_client, &state.config.keypair_path, Some(wallet_pubkey)).await {
+        info!("Auto-checkpointing miner before deploy for wallet: {}", payload.wallet_address);
+        match blockchain::auto_checkpoint_miner(&state.rpc_client, &state.config.keypair_path, Some(wallet_pubkey)).await {
             Ok(sig) => {
-                info!("Checkpoint completed: signature={}", sig);
+                info!("Auto-checkpoint completed: signature={}", sig);
             }
             Err(ApiError::Rpc(e)) => {
-                error!("Checkpoint before deploy failed: {}", e);
+                error!("Auto-checkpoint before deploy failed: {}", e);
                 return Err(handle_transaction_rpc_error(&e));
             }
             Err(other) => return Err(other),
@@ -1859,9 +2060,9 @@ async fn deploy(
         info!("Skipping checkpoint - miner account doesn't exist yet for wallet: {}", payload.wallet_address);
     }
 
-    // Perform blockchain deployment with priority fee support
-    info!("Performing blockchain deploy: amount={} lamports, square_ids={:?}, priority_fee=0", payload.amount, payload.square_ids);
-    let signature = match blockchain::deploy_ore_with_priority_fee(
+    // Perform blockchain deployment with auto-retry for blockhash issues
+    info!("Performing blockchain auto-retry deploy: amount={} lamports, square_ids={:?}, priority_fee=0", payload.amount, payload.square_ids);
+    let signature = match blockchain::deploy_ore_with_auto_retry(
         &state.rpc_client,
         &state.config.keypair_path,
         payload.amount,
@@ -1871,12 +2072,12 @@ async fn deploy(
     .await {
         Ok(sig) => sig,
         Err(ApiError::Rpc(e)) => {
-            error!("Deploy transaction failed: {}", e);
+            error!("Auto-retry deploy transaction failed: {}", e);
             return Err(handle_transaction_rpc_error(&e));
         }
         Err(other) => return Err(other),
     };
-    info!("Deploy transaction successful: signature={}", signature);
+    info!("Auto-retry deploy transaction successful: signature={}", signature);
 
     // Create mining session record
     let squares: Vec<i32> = if let Some(ids) = &payload.square_ids {
@@ -2504,22 +2705,22 @@ async fn deploy_for_round(
     let wallet_pubkey = user.wallet_address.parse::<solana_sdk::pubkey::Pubkey>()
         .map_err(|_| ApiError::Internal("Invalid wallet address in strategy".to_string()))?;
 
-    // Checkpoint miner first - FIXED: Use correct wallet authority
-    info!("Martingale strategy {} checkpointing miner for wallet: {}", strategy.id, user.wallet_address);
-    match blockchain::checkpoint_miner(&state.rpc_client, &state.config.keypair_path, Some(wallet_pubkey)).await {
+    // Checkpoint miner first - FIXED: Use correct wallet authority with auto-checkpoint
+    info!("Martingale strategy {} auto-checkpointing miner for wallet: {}", strategy.id, user.wallet_address);
+    match blockchain::auto_checkpoint_miner(&state.rpc_client, &state.config.keypair_path, Some(wallet_pubkey)).await {
         Ok(_) => {},
         Err(ApiError::Rpc(e)) => {
-            error!("Martingale strategy {} checkpoint failed: {}", strategy.id, e);
+            error!("Martingale strategy {} auto-checkpoint failed: {}", strategy.id, e);
             return Err(handle_transaction_rpc_error(&e));
         }
         Err(other) => return Err(other),
     };
 
-    // Deploy with improved error handling
+    // Deploy with improved error handling and auto-retry
     let amount_lamports = (strategy.current_amount_sol * blockchain::LAMPORTS_PER_SOL as f64) as u64;
-    info!("Martingale strategy {} deploying {} lamports to all squares", strategy.id, amount_lamports);
+    info!("Martingale strategy {} auto-retry deploying {} lamports to all squares", strategy.id, amount_lamports);
     
-    let _signature = match blockchain::deploy_ore_with_priority_fee(
+    let _signature = match blockchain::deploy_ore_with_auto_retry(
         &state.rpc_client,
         &state.config.keypair_path,
         amount_lamports,
@@ -2528,11 +2729,11 @@ async fn deploy_for_round(
     )
     .await {
         Ok(sig) => {
-            info!("Martingale strategy {} deployment successful: {}", strategy.id, sig);
+            info!("Martingale strategy {} auto-retry deployment successful: {}", strategy.id, sig);
             sig
         },
         Err(ApiError::Rpc(e)) => {
-            error!("Martingale strategy {} deployment failed: {}", strategy.id, e);
+            error!("Martingale strategy {} auto-retry deployment failed: {}", strategy.id, e);
             return Err(handle_transaction_rpc_error(&e));
         }
         Err(other) => return Err(other),
