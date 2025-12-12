@@ -1148,7 +1148,7 @@ pub mod blockchain {
         rpc: &RpcClient,
         keypair_path: &str,
         amount: u64,
-        square_id: Option<u64>,
+        square_ids: Option<Vec<u64>>,
     ) -> Result<String, ApiError> {
         if std::env::var("SIMULATE_ORE").unwrap_or_default() == "true" {
             return Ok("SimulatedDeploySignature1234567890abcdef".to_string());
@@ -1157,7 +1157,123 @@ pub mod blockchain {
         let payer = read_keypair_file(keypair_path)
             .map_err(|e| ApiError::BadRequest(format!("Keypair error: {}", e)))?;
 
-        // Get current board
+        // Get current board info
+        let board = get_board(rpc).await?;
+        let current_round_id = board.round_id;
+
+        let mut instructions = vec![];
+
+        // Check if miner needs checkpoint
+        let miner_address = ore_api::state::miner_pda(payer.pubkey()).0;
+        match rpc.get_account(&miner_address).await {
+            Ok(account) => {
+                use steel::AccountDeserialize;
+                let miner = ore_api::state::Miner::try_from_bytes(&account.data)
+                    .map_err(|e| ApiError::Internal(format!("Failed to deserialize miner: {}", e)))?;
+                
+                // If miner hasn't checkpointed for their last round, do it now
+                if miner.checkpoint_id < miner.round_id {
+                    info!("Miner needs checkpoint: checkpoint_id={}, round_id={}", 
+                        miner.checkpoint_id, miner.round_id);
+                    
+                    let checkpoint_ix = ore_api::sdk::checkpoint(
+                        payer.pubkey(),
+                        payer.pubkey(),
+                        miner.round_id,
+                    );
+                    instructions.push(checkpoint_ix);
+                }
+            }
+            Err(_) => {
+                info!("Miner account doesn't exist yet, will be created");
+            }
+        }
+
+        // Convert square_ids to squares array
+        let squares = if let Some(ids) = square_ids {
+            let mut arr = [false; 25];
+            for id in ids {
+                if id < 25 {
+                    arr[id as usize] = true;
+                }
+            }
+            arr
+        } else {
+            [true; 25] // Deploy to all squares if none specified
+        };
+
+        // Add deploy instruction
+        let deploy_ix = ore_api::sdk::deploy(
+            payer.pubkey(),
+            payer.pubkey(),
+            amount,
+            current_round_id,
+            squares,
+        );
+        instructions.push(deploy_ix);
+
+        // Add compute budget
+        let compute_limit = ComputeBudgetInstruction::set_compute_unit_limit(1_400_000);
+        let compute_price = ComputeBudgetInstruction::set_compute_unit_price(1_000_000);
+
+        // Build transaction with checkpoint + deploy
+        let mut all_instructions = vec![compute_limit, compute_price];
+        all_instructions.extend(instructions);
+
+        let blockhash = rpc.get_latest_blockhash().await?;
+        let tx = Transaction::new_signed_with_payer(
+            &all_instructions,
+            Some(&payer.pubkey()),
+            &[&payer],
+            blockhash,
+        );
+
+        let signature = rpc.send_and_confirm_transaction(&tx).await
+            .map_err(|e| ApiError::Internal(format!("Transaction failed: {}", e)))?;
+        
+        info!("Deploy transaction successful: signature={}", signature);
+
+        Ok(signature.to_string())
+    }
+
+    // Helper function to get board
+    async fn get_board(rpc: &RpcClient) -> Result<ore_api::state::Board, ApiError> {
+        use steel::AccountDeserialize;
+        
+        let board_pda = ore_api::state::board_pda();
+        let account = rpc.get_account(&board_pda.0).await
+            .map_err(|e| ApiError::Internal(format!("Failed to get board account: {}", e)))?;
+        
+        let board = ore_api::state::Board::try_from_bytes(&account.data)
+            .map_err(|e| ApiError::Internal(format!("Failed to deserialize board: {}", e)))?;
+        
+        Ok(*board)
+    }
+    
+    pub async fn deploy_ore_multiple(
+        rpc: &RpcClient,
+        keypair_path: &str,
+        amount: u64,
+        square_ids: Option<Vec<u64>>,
+    ) -> Result<String, ApiError> {
+        // Use the new function with default priority fee
+        deploy_ore_with_priority_fee(rpc, keypair_path, amount, square_ids, 0).await
+    }
+
+    pub async fn deploy_ore_with_priority_fee(
+        rpc: &RpcClient,
+        keypair_path: &str,
+        amount: u64,
+        square_ids: Option<Vec<u64>>,
+        priority_fee_microlamports: u64,
+    ) -> Result<String, ApiError> {
+        if std::env::var("SIMULATE_ORE").unwrap_or_default() == "true" {
+            return Ok("SimulatedDeploySignature1234567890abcdef".to_string());
+        }
+
+        let payer = read_keypair_file(keypair_path)
+            .map_err(|e| ApiError::BadRequest(format!("Keypair error: {}", e)))?;
+
         let board_pda = ore_api::state::board_pda();
         let account = rpc.get_account(&board_pda.0).await?;
         let board_size = std::mem::size_of::<ore_api::state::Board>();
@@ -1168,14 +1284,25 @@ pub mod blockchain {
         let board = bytemuck::try_from_bytes::<ore_api::state::Board>(board_data)
             .map_err(|e| ApiError::Internal(format!("Failed to parse board: {:?}", e)))?;
 
-        // Setup squares
-        let squares = if let Some(id) = square_id {
+        // Setup squares berdasarkan square_ids - FIXED: Better error handling
+        let squares = if let Some(ids) = square_ids {
             let mut s = [false; 25];
-            s[id as usize] = true;
+            for id in ids {
+                if id >= 25 {
+                    return Err(ApiError::BadRequest(format!("Invalid square ID: {}. Must be 0-24", id)));
+                }
+                s[id as usize] = true;
+            }
+            // Ensure at least one square is selected
+            if !s.iter().any(|&x| x) {
+                return Err(ApiError::BadRequest("At least one square must be selected".to_string()));
+            }
             s
         } else {
-            [true; 25]
+            [true; 25]  // Default: semua squares
         };
+
+        info!("Deploying {} lamports to squares: {:?}", amount, squares.iter().enumerate().filter(|(_, &x)| x).map(|(i, _)| i).collect::<Vec<_>>());
 
         // Create deploy instruction
         let ix = ore_api::sdk::deploy(
@@ -1186,9 +1313,9 @@ pub mod blockchain {
             squares,
         );
 
-        // Add compute budget
+        // Add compute budget with priority fee support
         let compute_limit = ComputeBudgetInstruction::set_compute_unit_limit(1_400_000);
-        let compute_price = ComputeBudgetInstruction::set_compute_unit_price(1_000_000);
+        let compute_price = ComputeBudgetInstruction::set_compute_unit_price(priority_fee_microlamports);
 
         let blockhash = rpc.get_latest_blockhash().await?;
         let tx = Transaction::new_signed_with_payer(
@@ -1198,68 +1325,17 @@ pub mod blockchain {
             blockhash,
         );
 
-        let signature = rpc.send_and_confirm_transaction(&tx).await?;
-        info!("Deploy transaction: {}", signature);
-    
+        info!("Sending transaction with priority fee: {} microlamports", priority_fee_microlamports);
+        let signature = rpc.send_and_confirm_transaction(&tx).await
+            .map_err(|e| {
+                error!("Transaction failed: {}", e);
+                ApiError::Internal(format!("Deploy transaction failed: {}", e))
+            })?;
+        
+        info!("Deploy transaction confirmed: {}", signature);
         Ok(signature.to_string())
     }
-    
-        pub async fn deploy_ore_multiple(
-            rpc: &RpcClient,
-            keypair_path: &str,
-            amount: u64,
-            square_ids: Option<Vec<u64>>,
-        ) -> Result<String, ApiError> {
-            let payer = read_keypair_file(keypair_path)
-                .map_err(|e| ApiError::BadRequest(format!("Keypair error: {}", e)))?;
-    
-            let board_pda = ore_api::state::board_pda();
-            let account = rpc.get_account(&board_pda.0).await?;
-            let board_size = std::mem::size_of::<ore_api::state::Board>();
-            if account.data.len() < 8 + board_size {
-                return Err(ApiError::Internal("Board account data too small".to_string()));
-            }
-            let board_data = &account.data[8..8 + board_size];
-            let board = bytemuck::try_from_bytes::<ore_api::state::Board>(board_data)
-                .map_err(|e| ApiError::Internal(format!("Failed to parse board: {:?}", e)))?;
-    
-            // Setup squares berdasarkan square_ids
-            let squares = if let Some(ids) = square_ids {
-                let mut s = [false; 25];
-                for id in ids {
-                    if id < 25 {
-                        s[id as usize] = true;
-                    }
-                }
-                s
-            } else {
-                [true; 25]  // Default: semua squares
-            };
-    
-            // TETAP 1 instruksi saja
-            let ix = ore_api::sdk::deploy(
-                payer.pubkey(),
-                payer.pubkey(),
-                amount,
-                board.round_id,
-                squares,
-            );
-    
-            let compute_limit = ComputeBudgetInstruction::set_compute_unit_limit(1_400_000);
-            let compute_price = ComputeBudgetInstruction::set_compute_unit_price(1_000_000);
-    
-            let blockhash = rpc.get_latest_blockhash().await?;
-            let tx = Transaction::new_signed_with_payer(
-                &[compute_limit, compute_price, ix],
-                Some(&payer.pubkey()),
-                &[&payer],
-                blockhash,
-            );
-    
-            let signature = rpc.send_and_confirm_transaction(&tx).await?;
-            Ok(signature.to_string())
-        }
-    
+
         pub async fn claim_rewards(
         rpc: &RpcClient,
         keypair_path: &str,
@@ -1366,19 +1442,6 @@ pub mod blockchain {
         }
     }
 
-    async fn get_board(rpc: &RpcClient) -> Result<ore_api::state::Board, ApiError> {
-        use steel::AccountDeserialize;
-        
-        let board_pda = ore_api::state::board_pda();
-        let account = rpc.get_account(&board_pda.0).await
-            .map_err(|e| ApiError::Internal(format!("Failed to get board account: {}", e)))?;
-        
-        let board = ore_api::state::Board::try_from_bytes(&account.data)
-            .map_err(|e| ApiError::Internal(format!("Failed to deserialize board: {}", e)))?;
-        
-        Ok(*board)
-    }
-
     pub async fn checkpoint_miner(
         rpc: &RpcClient,
         keypair_path: &str,
@@ -1393,9 +1456,19 @@ pub mod blockchain {
 
         let authority = authority.unwrap_or(payer.pubkey());
 
-        // Get miner info
+        info!("Checkpointing miner for authority: {}", authority);
+
+        // Get miner info - FIXED: Better error handling for account not found
         let miner_pda = ore_api::state::miner_pda(authority);
-        let account = rpc.get_account(&miner_pda.0).await?;
+        let account = match rpc.get_account(&miner_pda.0).await {
+            Ok(account) => account,
+            Err(e) => {
+                if e.to_string().contains("AccountNotFound") {
+                    return Err(ApiError::BadRequest(format!("Miner account not found for authority: {}", authority)));
+                }
+                return Err(ApiError::Rpc(e));
+            }
+        };
 
         let miner_size = std::mem::size_of::<ore_api::state::Miner>();
         if account.data.len() < 8 + miner_size {
@@ -1404,6 +1477,14 @@ pub mod blockchain {
         let miner_data = &account.data[8..8 + miner_size];
         let miner = bytemuck::try_from_bytes::<ore_api::state::Miner>(miner_data)
             .map_err(|e| ApiError::Internal(format!("Failed to parse miner: {:?}", e)))?;
+
+        // Check if checkpoint is needed
+        if miner.checkpoint_id >= miner.round_id {
+            info!("Miner already checkpointed for round {}, skipping", miner.round_id);
+            return Ok(format!("Already checkpointed: {}", miner_pda.0));
+        }
+
+        info!("Creating checkpoint for round {} (current checkpoint: {})", miner.round_id, miner.checkpoint_id);
 
         // Create checkpoint instruction
         let ix = ore_api::sdk::checkpoint(payer.pubkey(), authority, miner.round_id);
@@ -1420,8 +1501,13 @@ pub mod blockchain {
             blockhash,
         );
 
-        let signature = rpc.send_and_confirm_transaction(&tx).await?;
-        info!("Checkpoint transaction: {}", signature);
+        let signature = rpc.send_and_confirm_transaction(&tx).await
+            .map_err(|e| {
+                error!("Checkpoint transaction failed: {}", e);
+                ApiError::Internal(format!("Checkpoint transaction failed: {}", e))
+            })?;
+        
+        info!("Checkpoint transaction successful: {}", signature);
 
         Ok(signature.to_string())
     }
@@ -1733,13 +1819,17 @@ async fn deploy(
     let user = get_or_create_user(&state.db, &payload.wallet_address).await?;
     info!("User found/created: id={}, wallet={}", user.id, user.wallet_address);
 
+    // Parse wallet address to pubkey for miner PDA calculation
+    let wallet_pubkey = payload.wallet_address.parse::<solana_sdk::pubkey::Pubkey>()
+        .map_err(|_| ApiError::BadRequest("Invalid wallet address format".into()))?;
+
     // Get current board info for round_id
     info!("Fetching current board info");
     let board = blockchain::get_board_info(&state.rpc_client).await?;
     info!("Board info: round_id={}, current_slot={}", board.round_id, board.current_slot);
 
-    // Check if miner account exists before checkpointing
-    let miner_pda = ore_api::state::miner_pda(state.config.keypair_path.parse::<solana_sdk::pubkey::Pubkey>().unwrap_or_default());
+    // Check if miner account exists before checkpointing - FIXED: Use correct wallet pubkey
+    let miner_pda = ore_api::state::miner_pda(wallet_pubkey);
     let miner_exists = match state.rpc_client.get_account(&miner_pda.0).await {
         Ok(_) => true,
         Err(e) => {
@@ -1754,8 +1844,8 @@ async fn deploy(
     };
 
     if miner_exists {
-        info!("Checkpointing miner before deploy");
-        match blockchain::checkpoint_miner(&state.rpc_client, &state.config.keypair_path, None).await {
+        info!("Checkpointing miner before deploy for wallet: {}", payload.wallet_address);
+        match blockchain::checkpoint_miner(&state.rpc_client, &state.config.keypair_path, Some(wallet_pubkey)).await {
             Ok(sig) => {
                 info!("Checkpoint completed: signature={}", sig);
             }
@@ -1766,16 +1856,17 @@ async fn deploy(
             Err(other) => return Err(other),
         }
     } else {
-        info!("Skipping checkpoint - miner account doesn't exist yet");
+        info!("Skipping checkpoint - miner account doesn't exist yet for wallet: {}", payload.wallet_address);
     }
 
-    // Perform blockchain deployment
-    info!("Performing blockchain deploy: amount={} lamports, square_ids={:?}", payload.amount, payload.square_ids);
-    let signature = match blockchain::deploy_ore_multiple(
+    // Perform blockchain deployment with priority fee support
+    info!("Performing blockchain deploy: amount={} lamports, square_ids={:?}, priority_fee=0", payload.amount, payload.square_ids);
+    let signature = match blockchain::deploy_ore_with_priority_fee(
         &state.rpc_client,
         &state.config.keypair_path,
         payload.amount,
         payload.square_ids.clone(),
+        0, // priority fee set to 0 to match CLI
     )
     .await {
         Ok(sig) => sig,
@@ -1817,6 +1908,7 @@ async fn deploy(
         "signature": signature,
         "amount": payload.amount,
         "squares": payload.square_ids,
+        "priority_fee": 0,
         "user_id": user.id
     });
     info!("Deploy request completed successfully: {:?}", response);
@@ -2401,15 +2493,20 @@ async fn deploy_for_round(
     round_id: u64,
 ) -> Result<(), ApiError> {
     // Get user wallet
-    let _user: User = sqlx::query_as::<_, User>(
+    let user: User = sqlx::query_as::<_, User>(
         "SELECT * FROM users WHERE id = $1"
     )
     .bind(strategy.user_id)
     .fetch_one(&state.db)
     .await?;
 
-    // Checkpoint miner first
-    match blockchain::checkpoint_miner(&state.rpc_client, &state.config.keypair_path, None).await {
+    // Parse wallet address to pubkey
+    let wallet_pubkey = user.wallet_address.parse::<solana_sdk::pubkey::Pubkey>()
+        .map_err(|_| ApiError::Internal("Invalid wallet address in strategy".to_string()))?;
+
+    // Checkpoint miner first - FIXED: Use correct wallet authority
+    info!("Martingale strategy {} checkpointing miner for wallet: {}", strategy.id, user.wallet_address);
+    match blockchain::checkpoint_miner(&state.rpc_client, &state.config.keypair_path, Some(wallet_pubkey)).await {
         Ok(_) => {},
         Err(ApiError::Rpc(e)) => {
             error!("Martingale strategy {} checkpoint failed: {}", strategy.id, e);
@@ -2418,16 +2515,22 @@ async fn deploy_for_round(
         Err(other) => return Err(other),
     };
 
-    // Deploy
+    // Deploy with improved error handling
     let amount_lamports = (strategy.current_amount_sol * blockchain::LAMPORTS_PER_SOL as f64) as u64;
-    let _signature = match blockchain::deploy_ore(
+    info!("Martingale strategy {} deploying {} lamports to all squares", strategy.id, amount_lamports);
+    
+    let _signature = match blockchain::deploy_ore_with_priority_fee(
         &state.rpc_client,
         &state.config.keypair_path,
         amount_lamports,
         None, // deploy to all squares
+        0,    // no priority fee for martingale
     )
     .await {
-        Ok(sig) => sig,
+        Ok(sig) => {
+            info!("Martingale strategy {} deployment successful: {}", strategy.id, sig);
+            sig
+        },
         Err(ApiError::Rpc(e)) => {
             error!("Martingale strategy {} deployment failed: {}", strategy.id, e);
             return Err(handle_transaction_rpc_error(&e));
@@ -2451,16 +2554,17 @@ async fn deploy_for_round(
     .execute(&state.db)
     .await?;
 
-    // Update strategy last_round_id
+    // Update strategy last_round_id and totals
     sqlx::query(
-        "UPDATE martingale_strategies SET last_round_id = $1, updated_at = NOW() WHERE id = $2"
+        "UPDATE martingale_strategies SET last_round_id = $1, total_deployed_sol = $2, updated_at = NOW() WHERE id = $3"
     )
     .bind(round_id as i64)
+    .bind(strategy.total_deployed_sol + strategy.current_amount_sol)
     .bind(strategy.id)
     .execute(&state.db)
     .await?;
 
-    info!("Deployed {} SOL for strategy {} in round {}", strategy.current_amount_sol, strategy.id, round_id);
+    info!("Martingale strategy {} deployed {} SOL for round {}", strategy.id, strategy.current_amount_sol, round_id);
 
     Ok(())
 }
