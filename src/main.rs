@@ -20,6 +20,7 @@ use axum::http::Method;
 use tracing::{info, error, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use tokio::time::{sleep, Duration};
+use uuid::Uuid;
 
 // ============================================================================
 // WebSocket Message Types
@@ -40,7 +41,25 @@ pub enum WsMessage {
     TreasuryUpdate { treasury: TreasuryInfo },
     SquaresUpdate { squares: Vec<SquareStats> },
     RoundComplete { round_id: u64, winners: Vec<String> },
+    MartingaleProgressUpdate { progress: Vec<MartingaleProgressInfo> },
     Error { message: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MartingaleProgressInfo {
+    pub strategy_id: Uuid,
+    pub wallet_address: String,
+    pub current_round: i32,
+    pub total_rounds: i32,
+    pub progress_percentage: f64,
+    pub current_amount_sol: f64,
+    pub total_deployed_sol: f64,
+    pub total_rewards_sol: f64,
+    pub total_loss_sol: f64,
+    pub profit_loss_sol: f64,
+    pub status: String,
+    pub win_rate_percentage: f64,
+    pub risk_level: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -212,6 +231,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                             WsMessage::TreasuryUpdate { .. } => subscribed_topics.contains(&"treasury".to_string()),
                             WsMessage::SquaresUpdate { .. } => subscribed_topics.contains(&"squares".to_string()),
                             WsMessage::RoundComplete { .. } => true, // Always send round complete
+                            WsMessage::MartingaleProgressUpdate { .. } => {
+                                subscribed_topics.contains(&"martingale".to_string()) ||
+                                subscribed_topics.contains(&"all".to_string())
+                            }
                             WsMessage::MinerUpdate { wallet, .. } => {
                                 subscribed_topics.contains(&format!("miner:{}", wallet)) ||
                                 subscribed_topics.contains(&"miners".to_string())
@@ -271,6 +294,15 @@ async fn get_initial_data(state: &Arc<AppState>, topic: &str) -> WsMessage {
                 Err(e) => {
                     error!("Failed to fetch square stats for initial data: {}", e);
                     WsMessage::Error { message: "Failed to fetch square stats".to_string() }
+                }
+            }
+        }
+        "martingale" => {
+            match get_all_active_martingale_progress(state).await {
+                Ok(progress) => WsMessage::MartingaleProgressUpdate { progress },
+                Err(e) => {
+                    error!("Failed to fetch martingale progress for initial data: {}", e);
+                    WsMessage::Error { message: "Failed to fetch martingale progress".to_string() }
                 }
             }
         }
@@ -353,6 +385,18 @@ pub fn start_update_broadcaster(state: Arc<AppState>) {
                             if let Err(e) = update_round_results(&state, last).await {
                                 error!("Failed to update round results for round {}: {}", last, e);
                             }
+                            
+                            // Broadcast martingale progress updates for all active strategies
+                            info!("Broadcasting martingale progress updates for round change");
+                            match get_all_active_martingale_progress(&state).await {
+                                Ok(progress) => {
+                                    let msg = WsMessage::MartingaleProgressUpdate { progress };
+                                    let _ = state.broadcast.send(msg);
+                                }
+                                Err(e) => {
+                                    error!("Failed to get martingale progress for broadcast: {}", e);
+                                }
+                            }
                         }
                     }
                     last_round_id = Some(board.round_id);
@@ -387,6 +431,16 @@ pub fn start_update_broadcaster(state: Arc<AppState>) {
                     warn!("Failed to fetch treasury info for broadcast");
                 }
             }
+
+            // Broadcast martingale progress updates (every 60 seconds, every 4 ticks)
+            if counter % 4 == 0 {
+                if let Ok(progress) = get_all_active_martingale_progress(&state).await {
+                    let msg = WsMessage::MartingaleProgressUpdate { progress };
+                    let _ = state.broadcast.send(msg);
+                } else {
+                    warn!("Failed to fetch martingale progress for broadcast");
+                }
+            }
         }
     });
 }
@@ -412,6 +466,82 @@ async fn reconnect_redis(redis_url: &str) -> Option<redis::aio::ConnectionManage
         sleep(Duration::from_secs(2)).await;
     }
     None
+}
+
+async fn get_all_active_martingale_progress(state: &Arc<AppState>) -> Result<Vec<MartingaleProgressInfo>, ApiError> {
+    // Get all active martingale strategies
+    let strategies: Vec<MartingaleStrategy> = sqlx::query_as::<_, MartingaleStrategy>(
+        "SELECT * FROM martingale_strategies WHERE status = 'active' ORDER BY created_at DESC"
+    )
+    .fetch_all(&state.db)
+    .await?;
+
+    let mut progress_info = Vec::new();
+
+    for strategy in strategies {
+        // Get mining sessions for this strategy to calculate stats
+        let sessions: Vec<MiningSession> = sqlx::query_as::<_, MiningSession>(
+            r#"
+            SELECT ms.* FROM mining_sessions ms
+            WHERE ms.user_id = $1 AND ms.round_id <= $2
+            ORDER BY ms.round_id DESC
+            "#
+        )
+        .bind(strategy.user_id)
+        .bind(strategy.last_round_id.unwrap_or(0) as i64)
+        .fetch_all(&state.db)
+        .await?;
+
+        // Calculate progress metrics
+        let progress_percentage = if strategy.rounds > 0 {
+            (strategy.current_round as f64 / strategy.rounds as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        let profit_loss_sol = strategy.total_rewards_sol - strategy.total_deployed_sol;
+        let overall_roi = if strategy.total_deployed_sol > 0.0 {
+            (profit_loss_sol / strategy.total_deployed_sol) * 100.0
+        } else {
+            0.0
+        };
+
+        // Calculate win rate
+        let wins = sessions.iter().filter(|s| s.profitability.as_deref() == Some("win")).count();
+        let win_rate_percentage = if strategy.current_round > 0 {
+            (wins as f64 / strategy.current_round as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        // Calculate risk level
+        let max_possible_loss = strategy.max_loss_sol - strategy.total_loss_sol;
+        let risk_level = if max_possible_loss < strategy.current_amount_sol * 0.5 {
+            "HIGH".to_string()
+        } else if max_possible_loss < strategy.current_amount_sol {
+            "MEDIUM".to_string()
+        } else {
+            "LOW".to_string()
+        };
+
+        progress_info.push(MartingaleProgressInfo {
+            strategy_id: strategy.id,
+            wallet_address: strategy.wallet_address,
+            current_round: strategy.current_round,
+            total_rounds: strategy.rounds,
+            progress_percentage,
+            current_amount_sol: strategy.current_amount_sol,
+            total_deployed_sol: strategy.total_deployed_sol,
+            total_rewards_sol: strategy.total_rewards_sol,
+            total_loss_sol: strategy.total_loss_sol,
+            profit_loss_sol,
+            status: strategy.status,
+            win_rate_percentage,
+            risk_level,
+        });
+    }
+
+    Ok(progress_info)
 }
 
 // ============================================================================
