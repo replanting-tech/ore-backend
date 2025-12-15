@@ -367,6 +367,7 @@ pub fn start_update_broadcaster(state: Arc<AppState>) {
         }
 
 -------
+-------
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
         let mut counter = 0u64;
         let mut last_round_id: Option<u64> = None;
@@ -1115,6 +1116,7 @@ pub mod blockchain {
 
     pub async fn get_board_info(rpc: &RpcClient) -> Result<BoardInfo, ApiError> {
 -------
+-------
         if std::env::var("SIMULATE_ORE").unwrap_or_default() == "true" {
             use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1156,7 +1158,6 @@ pub mod blockchain {
                 round_id,
                 start_slot,
                 end_slot,
--------
                 current_slot: realistic_current_slot,
                 time_remaining_sec: time_remaining_sec.max(0.0),
             });
@@ -3373,6 +3374,7 @@ async fn main() -> Result<(), anyhow::Error> {
     });
 
 -------
+-------
     // Start background update broadcaster
     start_update_broadcaster(state.clone());
     info!("Background update broadcaster started");
@@ -3386,7 +3388,6 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // Start server
     let listener = TcpListener::bind("0.0.0.0:3000").await?;
--------
     info!("🚀 Server listening on http://0.0.0.0:3000");
     info!("📊 API Endpoints:");
     info!("   GET  /health");
