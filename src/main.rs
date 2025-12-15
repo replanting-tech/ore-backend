@@ -52,7 +52,6 @@ pub struct MartingaleProgressInfo {
     pub strategy_id: Uuid,
     pub wallet_address: String,
     pub current_round: i32,
-    pub total_rounds: i32,
     pub progress_percentage: f64,
     pub current_amount_sol: f64,
     pub total_deployed_sol: f64,
@@ -622,9 +621,10 @@ async fn get_all_active_martingale_progress(state: &Arc<AppState>) -> Result<Vec
         .fetch_all(&state.db)
         .await?;
 
-        // Calculate progress metrics
-        let progress_percentage = if strategy.rounds > 0 {
-            (strategy.current_round as f64 / strategy.rounds as f64) * 100.0
+        // Calculate progress metrics (unlimited rounds for auto mining)
+        let progress_percentage = if strategy.current_round > 0 {
+            // Show progress as completed rounds (no upper limit)
+            (strategy.current_round % 100) as f64 // Cycle every 100 rounds for display
         } else {
             0.0
         };
@@ -644,11 +644,10 @@ async fn get_all_active_martingale_progress(state: &Arc<AppState>) -> Result<Vec
             0.0
         };
 
-        // Calculate risk level
-        let max_possible_loss = strategy.max_loss_sol - strategy.total_loss_sol;
-        let risk_level = if max_possible_loss < strategy.current_amount_sol * 0.5 {
+        // Calculate risk level based on current losses vs next deployment
+        let risk_level = if strategy.total_loss_sol > strategy.current_amount_sol * 2.0 {
             "HIGH".to_string()
-        } else if max_possible_loss < strategy.current_amount_sol {
+        } else if strategy.total_loss_sol > strategy.current_amount_sol {
             "MEDIUM".to_string()
         } else {
             "LOW".to_string()
@@ -658,7 +657,6 @@ async fn get_all_active_martingale_progress(state: &Arc<AppState>) -> Result<Vec
             strategy_id: strategy.id,
             wallet_address: strategy.wallet_address,
             current_round: strategy.current_round,
-            total_rounds: strategy.rounds,
             progress_percentage,
             current_amount_sol: strategy.current_amount_sol,
             total_deployed_sol: strategy.total_deployed_sol,
@@ -766,10 +764,8 @@ pub struct MartingaleStrategy {
     pub id: uuid::Uuid,
     pub user_id: uuid::Uuid,
     pub wallet_address: String,
-    pub rounds: i32,
     pub base_amount_sol: f64,
     pub loss_multiplier: f64,
-    pub max_loss_sol: f64,
     pub status: String, // "active", "completed", "stopped"
     pub current_round: i32,
     pub current_amount_sol: f64,
@@ -852,10 +848,8 @@ pub struct DeployRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StartMartingaleRequest {
     pub wallet_address: String,
-    pub rounds: i32,
     pub base_amount_sol: f64,
     pub loss_multiplier: f64,
-    pub max_loss_sol: f64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2091,10 +2085,8 @@ pub async fn setup_database(pool: &PgPool) -> Result<(), sqlx::Error> {
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             user_id UUID NOT NULL REFERENCES users(id),
             wallet_address VARCHAR(44) NOT NULL,
-            rounds INTEGER NOT NULL,
             base_amount_sol DOUBLE PRECISION NOT NULL,
             loss_multiplier DOUBLE PRECISION NOT NULL,
-            max_loss_sol DOUBLE PRECISION NOT NULL,
             status VARCHAR(20) NOT NULL DEFAULT 'active',
             current_round INTEGER DEFAULT 0,
             current_amount_sol DOUBLE PRECISION NOT NULL,
@@ -2453,10 +2445,8 @@ async fn get_active_martingale(
             "success": true,
             "strategy": {
                 "id": s.id,
-                "rounds": s.rounds,
                 "base_amount_sol": s.base_amount_sol,
                 "loss_multiplier": s.loss_multiplier,
-                "max_loss_sol": s.max_loss_sol,
                 "status": s.status,
                 "current_round": s.current_round,
                 "current_amount_sol": s.current_amount_sol,
@@ -2599,13 +2589,11 @@ async fn get_martingale_progress(
             }));
         }
 
-        let remaining_rounds = s.rounds - s.current_round;
         let total_profit_loss = total_rewards - total_deployed;
         let overall_roi = if total_deployed > 0.0 { (total_profit_loss / total_deployed) * 100.0 } else { 0.0 };
-        let max_possible_loss = s.max_loss_sol - s.total_loss_sol;
-        let risk_level = if max_possible_loss < s.current_amount_sol * 0.5 {
+        let risk_level = if s.total_loss_sol > s.current_amount_sol * 2.0 {
             "HIGH".to_string()
-        } else if max_possible_loss < s.current_amount_sol {
+        } else if s.total_loss_sol > s.current_amount_sol {
             "MEDIUM".to_string()
         } else {
             "LOW".to_string()
@@ -2617,29 +2605,25 @@ async fn get_martingale_progress(
                 "id": s.id,
                 "status": s.status,
                 "current_round": s.current_round,
-                "total_rounds": s.rounds,
-                "remaining_rounds": remaining_rounds,
-                "progress_percentage": (s.current_round as f64 / s.rounds as f64) * 100.0,
-                
+                "progress_percentage": if s.current_round > 0 { (s.current_round % 100) as f64 } else { 0.0 },
+
                 "next_deployment": {
                     "amount_sol": s.current_amount_sol,
                     "round_id": s.last_round_id.map(|id| id + 1)
                 },
-                
+
                 "totals": {
                     "deployed_sol": total_deployed,
                     "rewards_sol": total_rewards,
                     "profit_loss_sol": total_profit_loss,
                     "overall_roi_percentage": overall_roi
                 },
-                
+
                 "risk_management": {
-                    "max_loss_limit_sol": s.max_loss_sol,
                     "current_loss_sol": s.total_loss_sol,
-                    "remaining_loss_budget_sol": max_possible_loss,
                     "risk_level": risk_level
                 },
-                
+
                 "performance": {
                     "total_rounds_played": s.current_round,
                     "wins": wins,
@@ -2647,9 +2631,9 @@ async fn get_martingale_progress(
                     "breakevens": breakevens,
                     "win_rate_percentage": if s.current_round > 0 { (wins as f64 / s.current_round as f64) * 100.0 } else { 0.0 }
                 },
-                
+
                 "round_history": round_history,
-                
+
                 "created_at": s.created_at,
                 "updated_at": s.updated_at
             }
@@ -2667,8 +2651,8 @@ async fn start_martingale(
     Json(payload): Json<StartMartingaleRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // Validate input
-    if payload.rounds <= 0 || payload.base_amount_sol <= 0.0 || payload.loss_multiplier <= 1.0 || payload.max_loss_sol <= 0.0 {
-        return Err(ApiError::BadRequest("Invalid parameters: rounds > 0, base_amount > 0, loss_multiplier > 1, max_loss > 0".into()));
+    if payload.base_amount_sol <= 0.0 || payload.loss_multiplier <= 1.0 {
+        return Err(ApiError::BadRequest("Invalid parameters: base_amount > 0, loss_multiplier > 1".into()));
     }
 
     if payload.wallet_address.len() != 44 {
@@ -2694,25 +2678,24 @@ async fn start_martingale(
     let strategy: MartingaleStrategy = sqlx::query_as::<_, MartingaleStrategy>(
         r#"
         INSERT INTO martingale_strategies (
-            user_id, wallet_address, rounds, base_amount_sol, loss_multiplier, max_loss_sol,
-            current_amount_sol
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+            user_id, wallet_address, base_amount_sol, loss_multiplier, current_amount_sol
+        ) VALUES ($1, $2, $3, $4, $5)
         RETURNING *
         "#
     )
     .bind(user.id)
     .bind(&payload.wallet_address)
-    .bind(payload.rounds)
     .bind(payload.base_amount_sol)
     .bind(payload.loss_multiplier)
-    .bind(payload.max_loss_sol)
     .bind(payload.base_amount_sol) // start with base amount
     .fetch_one(&state.db)
     .await?;
 
+    info!("🚀 Started auto mining strategy for wallet: {} with base amount: {} SOL", payload.wallet_address, payload.base_amount_sol);
+
     // Try initial deploy immediately
     if let Ok(board) = blockchain::get_board_info(&state.rpc_client).await {
-        if strategy.last_round_id != Some(board.round_id as i64) && strategy.current_round < strategy.rounds {
+        if strategy.last_round_id != Some(board.round_id as i64) {
             let _ = deploy_for_round(&state, &strategy, board.round_id).await;
         }
     }
@@ -2721,18 +2704,18 @@ async fn start_martingale(
     let state_clone = state.clone();
     let strategy_id = strategy.id;
     tokio::spawn(async move {
-        run_martingale_strategy(state_clone, strategy_id).await;
+        run_auto_mining_strategy(state_clone, strategy_id).await;
     });
 
     Ok(Json(serde_json::json!({
         "success": true,
         "strategy_id": strategy.id,
-        "message": "Martingale strategy started"
+        "message": "Auto mining strategy started - will deploy to all squares each round automatically"
     })))
 }
 
-async fn run_martingale_strategy(state: Arc<AppState>, strategy_id: uuid::Uuid) {
-    info!("Starting Martingale strategy execution for strategy: {}", strategy_id);
+async fn run_auto_mining_strategy(state: Arc<AppState>, strategy_id: uuid::Uuid) {
+    info!("🚀 Starting auto mining strategy execution for strategy: {}", strategy_id);
 
     let mut last_round_id: Option<u64> = None;
 
@@ -2749,10 +2732,43 @@ async fn run_martingale_strategy(state: Arc<AppState>, strategy_id: uuid::Uuid) 
         let strategy = match strategy {
             Some(s) if s.status == "active" => s,
             _ => {
-                info!("Martingale strategy {} is no longer active", strategy_id);
+                info!("🛑 Auto mining strategy {} is no longer active", strategy_id);
                 break;
             }
         };
+
+        // Check wallet balance before proceeding
+        let wallet_pubkey = match strategy.wallet_address.parse::<solana_sdk::pubkey::Pubkey>() {
+            Ok(pk) => pk,
+            Err(e) => {
+                error!("Invalid wallet address for strategy {}: {}", strategy_id, e);
+                break;
+            }
+        };
+
+        let balance = match state.rpc_client.get_balance(&wallet_pubkey).await {
+            Ok(b) => b as f64 / blockchain::LAMPORTS_PER_SOL as f64,
+            Err(e) => {
+                warn!("Failed to get balance for strategy {}: {}", strategy_id, e);
+                sleep(Duration::from_secs(10)).await;
+                continue;
+            }
+        };
+
+        let required_amount = strategy.current_amount_sol + 0.001; // Add small buffer for fees
+        if balance < required_amount {
+            warn!("💰 Insufficient balance for strategy {}: have {} SOL, need {} SOL", strategy_id, balance, required_amount);
+            // Stop the strategy
+            sqlx::query(
+                "UPDATE martingale_strategies SET status = 'stopped', updated_at = NOW() WHERE id = $1"
+            )
+            .bind(strategy_id)
+            .execute(&state.db)
+            .await
+            .unwrap_or_default();
+            info!("🛑 Stopped auto mining strategy {} due to insufficient balance", strategy_id);
+            break;
+        }
 
         // Get current board
         let board = match blockchain::get_board_info(&state.rpc_client).await {
@@ -2768,7 +2784,7 @@ async fn run_martingale_strategy(state: Arc<AppState>, strategy_id: uuid::Uuid) 
         if let Some(last) = last_round_id {
             if board.round_id != last {
                 // Round has ended, process the result
-                info!("Round {} ended for strategy {}, processing result", last, strategy_id);
+                info!("🔄 Round {} ended for auto mining strategy {}, processing result", last, strategy_id);
                 if let Err(e) = process_round_result(&state, &strategy, last).await {
                     error!("Failed to process round result for strategy {}: {}", strategy_id, e);
                     // Continue anyway
@@ -2780,10 +2796,10 @@ async fn run_martingale_strategy(state: Arc<AppState>, strategy_id: uuid::Uuid) 
         last_round_id = Some(board.round_id);
 
         // Check if we need to deploy for current round
-        if strategy.last_round_id != Some(board.round_id as i64) && strategy.current_round < strategy.rounds {
-            info!("Deploying for round {} in strategy {}", board.round_id, strategy_id);
+        if strategy.last_round_id != Some(board.round_id as i64) {
+            info!("🚀 Auto deploying {} SOL to all squares for round {} in strategy {}", strategy.current_amount_sol, board.round_id, strategy_id);
             if let Err(e) = deploy_for_round(&state, &strategy, board.round_id).await {
-                error!("Failed to deploy for strategy {}: {}", strategy_id, e);
+                error!("Failed to auto deploy for strategy {}: {}", strategy_id, e);
                 // If deployment fails, stop the strategy
                 sqlx::query(
                     "UPDATE martingale_strategies SET status = 'stopped', updated_at = NOW() WHERE id = $1"
@@ -2792,22 +2808,7 @@ async fn run_martingale_strategy(state: Arc<AppState>, strategy_id: uuid::Uuid) 
                 .execute(&state.db)
                 .await
                 .unwrap_or_default();
-                break;
-            }
-        }
-
-        // Check if strategy is complete
-        let updated_strategy: Option<MartingaleStrategy> = sqlx::query_as::<_, MartingaleStrategy>(
-            "SELECT * FROM martingale_strategies WHERE id = $1"
-        )
-        .bind(strategy_id)
-        .fetch_optional(&state.db)
-        .await
-        .unwrap_or(None);
-
-        if let Some(s) = updated_strategy {
-            if s.current_round >= s.rounds || s.status != "active" {
-                info!("Martingale strategy {} completed", strategy_id);
+                info!("🛑 Stopped auto mining strategy {} due to deployment failure", strategy_id);
                 break;
             }
         }
@@ -2816,7 +2817,7 @@ async fn run_martingale_strategy(state: Arc<AppState>, strategy_id: uuid::Uuid) 
         sleep(Duration::from_secs(30)).await;
     }
 
-    info!("Martingale strategy {} execution finished", strategy_id);
+    info!("🏁 Auto mining strategy {} execution finished", strategy_id);
 }
 
 async fn process_round_result(
@@ -2924,29 +2925,13 @@ async fn process_round_result(
     let mut new_current_round = strategy.current_round;
 
     if profitability == "loss" {
+        // Increase amount for next round using loss multiplier
         new_current_amount *= strategy.loss_multiplier;
-        // Check max loss
-        if new_total_loss + new_current_amount > strategy.max_loss_sol {
-            // Stop strategy
-            sqlx::query(
-                r#"
-                UPDATE martingale_strategies
-                SET status = 'stopped', total_deployed_sol = $1, total_rewards_sol = $2,
-                    total_loss_sol = $3, updated_at = NOW()
-                WHERE id = $4
-                "#
-            )
-            .bind(new_total_deployed)
-            .bind(new_total_rewards)
-            .bind(new_total_loss)
-            .bind(strategy.id)
-            .execute(&state.db)
-            .await?;
-            return Ok(());
-        }
+        info!("📈 Loss detected for strategy {}, increasing next deployment to {} SOL", strategy.id, new_current_amount);
     } else {
-        // Win or breakeven, reset to base amount
+        // Win, reset to base amount
         new_current_amount = strategy.base_amount_sol;
+        info!("🎉 Win detected for strategy {}, resetting to base amount {} SOL", strategy.id, new_current_amount);
     }
 
     new_current_round += 1;
@@ -2968,6 +2953,9 @@ async fn process_round_result(
     .bind(strategy.id)
     .execute(&state.db)
     .await?;
+
+    info!("📊 Updated strategy {} after round {}: round={}, deployed={}, rewards={}, loss={}, next_amount={}",
+          strategy.id, round_id, new_current_round, new_total_deployed, new_total_rewards, new_total_loss, new_current_amount);
 
     Ok(())
 }
