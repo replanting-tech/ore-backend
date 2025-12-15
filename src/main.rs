@@ -2714,6 +2714,42 @@ async fn start_martingale(
     })))
 }
 
+async fn start_all_active_martingale_strategies(state: Arc<AppState>) {
+    info!("🔄 Loading all active martingale strategies from database...");
+
+    // Get all active strategies
+    let active_strategies: Vec<MartingaleStrategy> = match sqlx::query_as::<_, MartingaleStrategy>(
+        "SELECT * FROM martingale_strategies WHERE status = 'active'"
+    )
+    .fetch_all(&state.db)
+    .await {
+        Ok(strategies) => strategies,
+        Err(e) => {
+            error!("Failed to load active martingale strategies: {}", e);
+            return;
+        }
+    };
+
+    info!("📊 Found {} active martingale strategies", active_strategies.len());
+
+    // Start each strategy in a background task
+    for strategy in active_strategies {
+        let state_clone = state.clone();
+        let strategy_id = strategy.id;
+        let wallet = strategy.wallet_address.clone();
+
+        info!("🚀 Auto-starting martingale strategy {} for wallet {}", strategy_id, wallet);
+
+        tokio::spawn(async move {
+            run_auto_mining_strategy(state_clone, strategy_id).await;
+        });
+    }
+
+    if active_strategies.is_empty() {
+        info!("ℹ️  No active martingale strategies to load");
+    }
+}
+
 async fn run_auto_mining_strategy(state: Arc<AppState>, strategy_id: uuid::Uuid) {
     info!("🚀 Starting auto mining strategy execution for strategy: {}", strategy_id);
 
@@ -3379,6 +3415,10 @@ async fn main() -> Result<(), anyhow::Error> {
     // Start dedicated round watcher for real-time monitoring
     start_round_watcher(state.clone());
     info!("Round watcher started for real-time monitoring");
+
+    // Auto-load and start all active martingale strategies
+    start_all_active_martingale_strategies(state.clone()).await;
+    info!("Auto-loaded active martingale strategies");
 
     // Build router
     let app = create_router(state);
