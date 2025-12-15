@@ -367,7 +367,6 @@ pub fn start_update_broadcaster(state: Arc<AppState>) {
         }
 
 -------
--------
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
         let mut counter = 0u64;
         let mut last_round_id: Option<u64> = None;
@@ -624,7 +623,7 @@ async fn get_all_active_martingale_progress(state: &Arc<AppState>) -> Result<Vec
         };
 
         let profit_loss_sol = strategy.total_rewards_sol - strategy.total_deployed_sol;
-        let overall_roi = if strategy.total_deployed_sol > 0.0 {
+        let _overall_roi = if strategy.total_deployed_sol > 0.0 {
             (profit_loss_sol / strategy.total_deployed_sol) * 100.0
         } else {
             0.0
@@ -3373,7 +3372,6 @@ async fn main() -> Result<(), anyhow::Error> {
         max_connections,
     });
 
--------
 -------
     // Start background update broadcaster
     start_update_broadcaster(state.clone());
