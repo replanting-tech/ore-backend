@@ -2730,7 +2730,13 @@ async fn start_all_active_martingale_strategies(state: Arc<AppState>) {
         }
     };
 
-    info!("📊 Found {} active martingale strategies", active_strategies.len());
+    let strategy_count = active_strategies.len();
+    info!("📊 Found {} active martingale strategies", strategy_count);
+
+    if strategy_count == 0 {
+        info!("ℹ️  No active martingale strategies to load");
+        return;
+    }
 
     // Start each strategy in a background task
     for strategy in active_strategies {
@@ -2743,10 +2749,6 @@ async fn start_all_active_martingale_strategies(state: Arc<AppState>) {
         tokio::spawn(async move {
             run_auto_mining_strategy(state_clone, strategy_id).await;
         });
-    }
-
-    if active_strategies.is_empty() {
-        info!("ℹ️  No active martingale strategies to load");
     }
 }
 
