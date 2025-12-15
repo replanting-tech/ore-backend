@@ -382,13 +382,13 @@ pub fn start_update_broadcaster(state: Arc<AppState>) {
                                last_rpc_fetch.elapsed() >= Duration::from_secs(10) || 
                                _last_board_info.as_ref().map(|b| b.time_remaining_sec <= 5.0).unwrap_or(false);
 
-            let board_result = if should_fetch {
+            let board_result: Result<BoardInfo, ApiError> = if should_fetch {
                 match blockchain::get_board_info(&state.rpc_client).await {
                     Ok(board) => {
                         last_rpc_fetch = Instant::now();
                         Ok(board)
                     }
-                    Err(e) => Err(e) // Propagate error to handle it below
+                    Err(e) => Err(ApiError::from(e))
                 }
             } else {
                 // Simulate locally
@@ -398,11 +398,7 @@ pub fn start_update_broadcaster(state: Arc<AppState>) {
                     board.current_slot += 2;
                     Ok(board)
                 } else {
-                    // Should rely on fetch if no data, so this path shouldn't be hit easily due to should_fetch logic, 
-                    // but if fetch fails previously and we have no data, we might need to retry fetch. 
-                    // Actually if _last_board_info is None, should_fetch is true. 
-                    // If fetch fails, we land in Err below.
-                    Err(anyhow::anyhow!("No board data available for simulation").into()) 
+                    Err(ApiError::Internal("No board data available for simulation".to_string()))
                 }
             };
 
@@ -516,11 +512,9 @@ pub fn start_round_watcher(state: Arc<AppState>) {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
         let mut last_round_id: Option<u64> = None;
         let mut round_start_time: Option<i64> = None;
-        let mut tick_count = 0u64;
 
         loop {
             interval.tick().await;
-            tick_count += 1;
 
             match blockchain::get_board_info(&state.rpc_client).await {
                 Ok(board) => {
