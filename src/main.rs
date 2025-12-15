@@ -540,6 +540,10 @@ pub fn start_round_watcher(state: Arc<AppState>) {
                                 winners: Vec::new(), // Could be populated with actual winners
                             };
                             let _ = state.broadcast.send(completion_msg);
+
+                            // Send new round info immediately so clients know the next round has started
+                            let board_msg = WsMessage::BoardUpdate { board: board.clone() };
+                            let _ = state.broadcast.send(board_msg);
                             
                             round_start_time = Some(current_time);
                         }
