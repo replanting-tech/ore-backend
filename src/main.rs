@@ -366,46 +366,73 @@ pub fn start_update_broadcaster(state: Arc<AppState>) {
             sleep(Duration::from_secs(5)).await;
         }
 
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(15));
+-------
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
         let mut counter = 0u64;
         let mut last_round_id: Option<u64> = None;
+        let mut last_board_info: Option<BoardInfo> = None;
 
         loop {
             interval.tick().await;
             counter += 1;
 
-            // Broadcast board updates (every 60 seconds, every 4 ticks)
-            if counter % 4 == 0 {
-                if let Ok(board) = blockchain::get_board_info(&state.rpc_client).await {
-                    // Check if round changed
-                    if let Some(last) = last_round_id {
-                        if board.round_id != last {
-                            // Round has ended, update sessions for the previous round
-                            info!("Round {} ended, updating session results", last);
-                            if let Err(e) = update_round_results(&state, last).await {
-                                error!("Failed to update round results for round {}: {}", last, e);
+            // Broadcast frequent board updates (every 1 second for countdown display)
+            if let Ok(board) = blockchain::get_board_info(&state.rpc_client).await {
+                // Check if round changed
+                if let Some(last) = last_round_id {
+                    if board.round_id != last {
+                        // Round has ended, update sessions for the previous round
+                        info!("🔄 ROUND CHANGE: Round {} ended, updating session results", last);
+                        if let Err(e) = update_round_results(&state, last).await {
+                            error!("❌ Failed to update round results for round {}: {}", last, e);
+                        }
+                        
+                        // Broadcast martingale progress updates for all active strategies
+                        info!("🔄 Broadcasting martingale progress updates for round change");
+                        match get_all_active_martingale_progress(&state).await {
+                            Ok(progress) => {
+                                let msg = WsMessage::MartingaleProgressUpdate { progress };
+                                let _ = state.broadcast.send(msg);
                             }
-                            
-                            // Broadcast martingale progress updates for all active strategies
-                            info!("Broadcasting martingale progress updates for round change");
-                            match get_all_active_martingale_progress(&state).await {
-                                Ok(progress) => {
-                                    let msg = WsMessage::MartingaleProgressUpdate { progress };
-                                    let _ = state.broadcast.send(msg);
-                                }
-                                Err(e) => {
-                                    error!("Failed to get martingale progress for broadcast: {}", e);
-                                }
+                            Err(e) => {
+                                error!("❌ Failed to get martingale progress for broadcast: {}", e);
                             }
                         }
                     }
-                    last_round_id = Some(board.round_id);
-
-                    let msg = WsMessage::BoardUpdate { board };
-                    let _ = state.broadcast.send(msg);
-                } else {
-                    warn!("Failed to fetch board info for broadcast");
                 }
+                last_round_id = Some(board.round_id);
+
+                // Enhanced logging with countdown information
+                let time_remaining = board.time_remaining_sec;
+                let minutes = (time_remaining / 60.0) as u64;
+                let seconds = (time_remaining % 60.0) as u64;
+                let current_seconds = chrono::Utc::now().timestamp();
+                
+                info!("⏰ ROUND {} | ⏱️  Time Remaining: {}:{:02} ({} seconds) | 🎯 Current Slot: {} | 📊 Live Countdown",
+                      board.round_id,
+                      minutes,
+                      seconds,
+                      time_remaining.round() as u64,
+                      board.current_slot);
+                
+                // Log significant countdown milestones
+                if time_remaining <= 10.0 && time_remaining > 9.0 {
+                    info!("🚨 WARNING: Round {} will end in 10 seconds!", board.round_id);
+                } else if time_remaining <= 5.0 && time_remaining > 4.0 {
+                    info!("⚠️  FINAL COUNTDOWN: Round {} will end in 5 seconds!", board.round_id);
+                } else if time_remaining <= 1.0 && time_remaining > 0.0 {
+                    info!("💥 ROUND {} ENDING NOW!", board.round_id);
+                }
+
+                // Send board update to WebSocket clients
+                let msg = WsMessage::BoardUpdate { board: board.clone() };
+                if let Err(e) = state.broadcast.send(msg) {
+                    warn!("Failed to send board update to WebSocket clients: {}", e);
+                }
+
+                last_board_info = Some(board);
+            } else {
+                warn!("⚠️ Failed to fetch board info for broadcast");
             }
 
             // Broadcast square stats every 45 seconds (every 3 ticks) - with connection management
@@ -439,6 +466,102 @@ pub fn start_update_broadcaster(state: Arc<AppState>) {
                     let _ = state.broadcast.send(msg);
                 } else {
                     warn!("Failed to fetch martingale progress for broadcast");
+                }
+            }
+        }
+    });
+}
+
+// ============================================================================
+// Round Watcher - Real-time monitoring with detailed logging
+// ============================================================================
+
+pub fn start_round_watcher(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        info!("👀 ROUND WATCHER started - monitoring round changes in real-time");
+        
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
+        let mut last_round_id: Option<u64> = None;
+        let mut round_start_time: Option<i64> = None;
+        let mut tick_count = 0u64;
+
+        loop {
+            interval.tick().await;
+            tick_count += 1;
+
+            match blockchain::get_board_info(&state.rpc_client).await {
+                Ok(board) => {
+                    let current_time = chrono::Utc::now().timestamp();
+                    
+                    // Detect round changes
+                    if let Some(last_round) = last_round_id {
+                        if board.round_id != last_round {
+                            let old_round_duration = if let Some(start_time) = round_start_time {
+                                current_time - start_time
+                            } else {
+                                0
+                            };
+                            
+                            info!("🔄 ROUND TRANSITION DETECTED!");
+                            info!("   📊 Previous Round: {} (Duration: {} seconds)", last_round, old_round_duration);
+                            info!("   🎯 New Round: {} started at {}", board.round_id, current_time);
+                            info!("   ⏰ New Round ends in: {} seconds", board.time_remaining_sec.round());
+                            
+                            // Broadcast round completion message
+                            let completion_msg = WsMessage::RoundComplete {
+                                round_id: last_round,
+                                winners: Vec::new(), // Could be populated with actual winners
+                            };
+                            let _ = state.broadcast.send(completion_msg);
+                            
+                            round_start_time = Some(current_time);
+                        }
+                    } else {
+                        // First time seeing a round
+                        info!("🎯 Initial Round Detected: {} (started at {})", board.round_id, current_time);
+                        round_start_time = Some(current_time);
+                    }
+                    
+                    last_round_id = Some(board.round_id);
+                    
+                    // Detailed countdown logging every 10 ticks (10 seconds)
+                    if tick_count % 10 == 0 {
+                        let progress_percent = ((60.0 - board.time_remaining_sec) / 60.0) * 100.0;
+                        let slots_remaining = board.end_slot.saturating_sub(board.current_slot);
+                        let slots_total = board.end_slot.saturating_sub(board.start_slot);
+                        let slot_progress = if slots_total > 0 {
+                            ((board.current_slot.saturating_sub(board.start_slot)) as f64 / slots_total as f64) * 100.0
+                        } else {
+                            0.0
+                        };
+                        
+                        info!("📊 ROUND {} PROGRESS REPORT", board.round_id);
+                        info!("   ⏱️  Time: {} seconds remaining ({}%)",
+                              board.time_remaining_sec.round(),
+                              progress_percent.round());
+                        info!("   🎰 Slots: {} remaining out of {} total ({}% complete)",
+                              slots_remaining,
+                              slots_total,
+                              slot_progress.round());
+                        info!("   🔢 Current Slot: {}", board.current_slot);
+                    }
+                    
+                    // Critical warnings for last 30 seconds
+                    if board.time_remaining_sec <= 30.0 && board.time_remaining_sec > 0.0 {
+                        let remaining_int = board.time_remaining_sec.round() as u64;
+                        if remaining_int % 5 == 0 && board.time_remaining_sec.fract() < 1.0 {
+                            info!("⚠️  ROUND {} ENDS IN {} SECONDS!", board.round_id, remaining_int);
+                        }
+                    }
+                    
+                    // Final 5 second countdown
+                    if board.time_remaining_sec <= 5.0 && board.time_remaining_sec > 0.0 {
+                        let remaining_int = board.time_remaining_sec.round() as u64;
+                        info!("🚨 ROUND {} FINAL COUNTDOWN: {}!", board.round_id, remaining_int);
+                    }
+                }
+                Err(e) => {
+                    warn!("❌ Failed to get board info in round watcher: {}", e);
                 }
             }
         }
@@ -991,31 +1114,50 @@ pub mod blockchain {
     }
 
     pub async fn get_board_info(rpc: &RpcClient) -> Result<BoardInfo, ApiError> {
+-------
         if std::env::var("SIMULATE_ORE").unwrap_or_default() == "true" {
             use std::time::{SystemTime, UNIX_EPOCH};
 
-            // Simulate round progression based on current time
+            // Simulate round progression based on current time with millisecond precision
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
+                .unwrap();
+            let now_secs = now.as_secs();
+            let now_millis = now.subsec_millis();
 
             // Each round lasts 60 seconds, base round_id on time
-            let round_id = 12345 + (now / 60) as u64;
-            let round_start_time = (now / 60) * 60;
-            let elapsed_in_round = now - round_start_time;
+            let round_id = 12345 + (now_secs / 60) as u64;
+            let round_start_time = (now_secs / 60) * 60;
+            let elapsed_in_round = now_secs - round_start_time;
+            let elapsed_millis = now_millis as f64 / 1000.0;
+            let total_elapsed = elapsed_in_round as f64 + elapsed_millis;
 
-            // Calculate slots (0.4 sec per slot)
+            // Calculate slots (0.4 sec per slot = 2.5 slots per second)
             let start_slot = 1000 + (round_id - 12345) * 150;
             let end_slot = start_slot + 150;
-            let current_slot = start_slot + (elapsed_in_round as f64 * 2.5) as u64; // 2.5 slots per second
-            let time_remaining_sec = 60.0 - elapsed_in_round as f64;
+            let current_slot = start_slot + (total_elapsed * 2.5) as u64;
+            let time_remaining_sec = 60.0 - total_elapsed;
+
+            // Add some realistic slot progression
+            let realistic_current_slot = current_slot.min(end_slot);
+            let slot_progress = if end_slot > start_slot {
+                ((realistic_current_slot - start_slot) as f64 / (end_slot - start_slot) as f64) * 100.0
+            } else {
+                0.0
+            };
+
+            // Log detailed simulation info occasionally
+            if now_millis < 100 { // First 100ms of each second
+                debug!("🎮 SIMULATION: Round {}, Slot {}/{} ({}% complete), {} seconds remaining",
+                       round_id, realistic_current_slot, end_slot, slot_progress.round(), time_remaining_sec.round());
+            }
 
             return Ok(BoardInfo {
                 round_id,
                 start_slot,
                 end_slot,
-                current_slot: current_slot.min(end_slot),
+-------
+                current_slot: realistic_current_slot,
                 time_remaining_sec: time_remaining_sec.max(0.0),
             });
         }
@@ -3230,15 +3372,21 @@ async fn main() -> Result<(), anyhow::Error> {
         max_connections,
     });
 
+-------
     // Start background update broadcaster
     start_update_broadcaster(state.clone());
     info!("Background update broadcaster started");
+
+    // Start dedicated round watcher for real-time monitoring
+    start_round_watcher(state.clone());
+    info!("Round watcher started for real-time monitoring");
 
     // Build router
     let app = create_router(state);
 
     // Start server
     let listener = TcpListener::bind("0.0.0.0:3000").await?;
+-------
     info!("🚀 Server listening on http://0.0.0.0:3000");
     info!("📊 API Endpoints:");
     info!("   GET  /health");
@@ -3257,8 +3405,31 @@ async fn main() -> Result<(), anyhow::Error> {
     info!("   GET  /api/martingale/active/:wallet");
     info!("   GET  /api/martingale/progress/:wallet");
     info!("   GET  /api/mining/active/:wallet");
-    info!("   GET  /api/stats/global"); 
+    info!("   GET  /api/stats/global");
     info!("   POST /api/user/burner-address");
+
+    // Enhanced startup information
+    info!("🎯 ROUND MONITORING FEATURES:");
+    info!("   ⏰ Real-time countdown updates every second");
+    info!("   📈 Round progress tracking with slot information");
+    info!("   🚨 Critical alerts for round endings (10s, 5s, 1s warnings)");
+    info!("   📊 WebSocket broadcasts for live client updates");
+    info!("   🔄 Automatic round transition detection and logging");
+    
+    if std::env::var("SIMULATE_ORE").unwrap_or_default() == "true" {
+        info!("🎮 SIMULATION MODE ACTIVE - Round changes every 60 seconds");
+        info!("   💡 Perfect for testing and monitoring round updates!");
+    } else {
+        info!("🌐 MAINNET MODE - Connected to Solana blockchain");
+        info!("   ⛓️  Real blockchain data with actual round timings");
+    }
+    
+    info!("👀 ROUND WATCHER ACTIVE - Watch the logs tick by tick!");
+    info!("🔍 Look for these log patterns:");
+    info!("   ⏰ ROUND X | Time Remaining: M:SS (N seconds) | Live Countdown");
+    info!("   📊 ROUND X PROGRESS REPORT (every 10 seconds)");
+    info!("   ⚠️  ROUND X ENDS IN Y SECONDS! (final 30 seconds)");
+    info!("   🚨 ROUND X FINAL COUNTDOWN: Z! (last 5 seconds)");
 
     axum::serve(listener, app).await?;
 
