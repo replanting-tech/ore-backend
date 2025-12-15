@@ -366,7 +366,6 @@ pub fn start_update_broadcaster(state: Arc<AppState>) {
             sleep(Duration::from_secs(5)).await;
         }
 
--------
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
         let mut counter = 0u64;
         let mut last_round_id: Option<u64> = None;
@@ -1114,8 +1113,6 @@ pub mod blockchain {
     }
 
     pub async fn get_board_info(rpc: &RpcClient) -> Result<BoardInfo, ApiError> {
--------
--------
         if std::env::var("SIMULATE_ORE").unwrap_or_default() == "true" {
             use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -3372,7 +3369,6 @@ async fn main() -> Result<(), anyhow::Error> {
         max_connections,
     });
 
--------
     // Start background update broadcaster
     start_update_broadcaster(state.clone());
     info!("Background update broadcaster started");
