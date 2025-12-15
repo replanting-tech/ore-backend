@@ -17,7 +17,7 @@ use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tower_http::cors::{CorsLayer, AllowOrigin, AllowHeaders, AllowMethods};
 use axum::http::Method;
-use tracing::{info, error, warn};
+use tracing::{debug, info, error, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use tokio::time::{sleep, Duration};
 use uuid::Uuid;
@@ -369,7 +369,7 @@ pub fn start_update_broadcaster(state: Arc<AppState>) {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
         let mut counter = 0u64;
         let mut last_round_id: Option<u64> = None;
-        let mut last_board_info: Option<BoardInfo> = None;
+        let mut _last_board_info: Option<BoardInfo> = None;
 
         loop {
             interval.tick().await;
@@ -405,7 +405,7 @@ pub fn start_update_broadcaster(state: Arc<AppState>) {
                 let time_remaining = board.time_remaining_sec;
                 let minutes = (time_remaining / 60.0) as u64;
                 let seconds = (time_remaining % 60.0) as u64;
-                let current_seconds = chrono::Utc::now().timestamp();
+                let _current_seconds = chrono::Utc::now().timestamp();
                 
                 info!("⏰ ROUND {} | ⏱️  Time Remaining: {}:{:02} ({} seconds) | 🎯 Current Slot: {} | 📊 Live Countdown",
                       board.round_id,
@@ -429,7 +429,7 @@ pub fn start_update_broadcaster(state: Arc<AppState>) {
                     warn!("Failed to send board update to WebSocket clients: {}", e);
                 }
 
-                last_board_info = Some(board);
+                _last_board_info = Some(board);
             } else {
                 warn!("⚠️ Failed to fetch board info for broadcast");
             }
