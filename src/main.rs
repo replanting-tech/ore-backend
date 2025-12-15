@@ -14,6 +14,7 @@ use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::net::TcpListener;
+use std::time::Instant;
 use tokio::sync::broadcast;
 use tower_http::cors::{CorsLayer, AllowOrigin, AllowHeaders, AllowMethods};
 use axum::http::Method;
@@ -370,14 +371,44 @@ pub fn start_update_broadcaster(state: Arc<AppState>) {
         let mut counter = 0u64;
         let mut last_round_id: Option<u64> = None;
         let mut _last_board_info: Option<BoardInfo> = None;
+        let mut last_rpc_fetch = Instant::now().checked_sub(Duration::from_secs(100)).unwrap_or(Instant::now());
 
         loop {
             interval.tick().await;
             counter += 1;
 
-            // Broadcast frequent board updates (every 1 second for countdown display)
-            if let Ok(board) = blockchain::get_board_info(&state.rpc_client).await {
-                // Check if round changed
+            // Determine if we should fetch fresh data
+            let should_fetch = _last_board_info.is_none() || 
+                               last_rpc_fetch.elapsed() >= Duration::from_secs(10) || 
+                               _last_board_info.as_ref().map(|b| b.time_remaining_sec <= 5.0).unwrap_or(false);
+
+            let board_result = if should_fetch {
+                match blockchain::get_board_info(&state.rpc_client).await {
+                    Ok(board) => {
+                        last_rpc_fetch = Instant::now();
+                        Ok(board)
+                    }
+                    Err(e) => Err(e) // Propagate error to handle it below
+                }
+            } else {
+                // Simulate locally
+                if let Some(mut board) = _last_board_info.clone() {
+                    board.time_remaining_sec = (board.time_remaining_sec - 1.0).max(0.0);
+                    // Approximate slot progress (2 slots/sec)
+                    board.current_slot += 2;
+                    Ok(board)
+                } else {
+                    // Should rely on fetch if no data, so this path shouldn't be hit easily due to should_fetch logic, 
+                    // but if fetch fails previously and we have no data, we might need to retry fetch. 
+                    // Actually if _last_board_info is None, should_fetch is true. 
+                    // If fetch fails, we land in Err below.
+                    Err(anyhow::anyhow!("No board data available for simulation").into()) 
+                }
+            };
+
+            // Process the board data (fetched or simulated)
+            if let Ok(board) = board_result {
+                // Check if round changed (Only effective when we fetched fresh data really, but logic holds)
                 if let Some(last) = last_round_id {
                     if board.round_id != last {
                         // Round has ended, update sessions for the previous round
@@ -431,7 +462,10 @@ pub fn start_update_broadcaster(state: Arc<AppState>) {
 
                 _last_board_info = Some(board);
             } else {
-                warn!("⚠️ Failed to fetch board info for broadcast");
+                // Only warn if we really expected a board (i.e. we tried to fetch)
+                if should_fetch {
+                    warn!("⚠️ Failed to fetch board info for broadcast");
+                }
             }
 
             // Broadcast square stats every 45 seconds (every 3 ticks) - with connection management
@@ -479,7 +513,7 @@ pub fn start_round_watcher(state: Arc<AppState>) {
     tokio::spawn(async move {
         info!("👀 ROUND WATCHER started - monitoring round changes in real-time");
         
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
         let mut last_round_id: Option<u64> = None;
         let mut round_start_time: Option<i64> = None;
         let mut tick_count = 0u64;
@@ -521,43 +555,10 @@ pub fn start_round_watcher(state: Arc<AppState>) {
                         round_start_time = Some(current_time);
                     }
                     
+                    
                     last_round_id = Some(board.round_id);
                     
-                    // Detailed countdown logging every 10 ticks (10 seconds)
-                    if tick_count % 10 == 0 {
-                        let progress_percent = ((60.0 - board.time_remaining_sec) / 60.0) * 100.0;
-                        let slots_remaining = board.end_slot.saturating_sub(board.current_slot);
-                        let slots_total = board.end_slot.saturating_sub(board.start_slot);
-                        let slot_progress = if slots_total > 0 {
-                            ((board.current_slot.saturating_sub(board.start_slot)) as f64 / slots_total as f64) * 100.0
-                        } else {
-                            0.0
-                        };
-                        
-                        info!("📊 ROUND {} PROGRESS REPORT", board.round_id);
-                        info!("   ⏱️  Time: {} seconds remaining ({}%)",
-                              board.time_remaining_sec.round(),
-                              progress_percent.round());
-                        info!("   🎰 Slots: {} remaining out of {} total ({}% complete)",
-                              slots_remaining,
-                              slots_total,
-                              slot_progress.round());
-                        info!("   🔢 Current Slot: {}", board.current_slot);
-                    }
-                    
-                    // Critical warnings for last 30 seconds
-                    if board.time_remaining_sec <= 30.0 && board.time_remaining_sec > 0.0 {
-                        let remaining_int = board.time_remaining_sec.round() as u64;
-                        if remaining_int % 5 == 0 && board.time_remaining_sec.fract() < 1.0 {
-                            info!("⚠️  ROUND {} ENDS IN {} SECONDS!", board.round_id, remaining_int);
-                        }
-                    }
-                    
-                    // Final 5 second countdown
-                    if board.time_remaining_sec <= 5.0 && board.time_remaining_sec > 0.0 {
-                        let remaining_int = board.time_remaining_sec.round() as u64;
-                        info!("🚨 ROUND {} FINAL COUNTDOWN: {}!", board.round_id, remaining_int);
-                    }
+                    // Removed verbose progress logging and redundant warnings
                 }
                 Err(e) => {
                     warn!("❌ Failed to get board info in round watcher: {}", e);
