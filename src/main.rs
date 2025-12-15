@@ -42,6 +42,7 @@ pub enum WsMessage {
     TreasuryUpdate { treasury: TreasuryInfo },
     SquaresUpdate { squares: Vec<SquareStats> },
     RoundComplete { round_id: u64, winners: Vec<String> },
+    RoundStarted { round_id: u64, board: BoardInfo },
     MartingaleProgressUpdate { progress: Vec<MartingaleProgressInfo> },
     Error { message: String },
 }
@@ -232,6 +233,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                             WsMessage::TreasuryUpdate { .. } => subscribed_topics.contains(&"treasury".to_string()),
                             WsMessage::SquaresUpdate { .. } => subscribed_topics.contains(&"squares".to_string()),
                             WsMessage::RoundComplete { .. } => true, // Always send round complete
+                            WsMessage::RoundStarted { .. } => true, // Always send round started
                             WsMessage::MartingaleProgressUpdate { .. } => {
                                 subscribed_topics.contains(&"martingale".to_string()) ||
                                 subscribed_topics.contains(&"all".to_string())
@@ -540,6 +542,13 @@ pub fn start_round_watcher(state: Arc<AppState>) {
                                 winners: Vec::new(), // Could be populated with actual winners
                             };
                             let _ = state.broadcast.send(completion_msg);
+
+                            // Broadcast round started message
+                            let started_msg = WsMessage::RoundStarted {
+                                round_id: board.round_id,
+                                board: board.clone(),
+                            };
+                            let _ = state.broadcast.send(started_msg);
 
                             // Send new round info immediately so clients know the next round has started
                             let board_msg = WsMessage::BoardUpdate { board: board.clone() };
@@ -1198,7 +1207,14 @@ pub mod blockchain {
 
             // Calculate time remaining dengan benar
             let slots_remaining = board.end_slot.saturating_sub(clock.slot);
-            let time_remaining = (slots_remaining as f64) * 0.4;
+            
+            // Fix: Handle u64::MAX case or absurdly large slots which causes huge time remaining
+            // If slots_remaining > 1,000,000 (approx 4.6 days), assume it's invalid/sentinel
+            let time_remaining = if slots_remaining > 1_000_000 {
+                0.0
+            } else {
+                (slots_remaining as f64) * 0.4
+            };
 
             Ok(BoardInfo {
                 round_id: board.round_id,
