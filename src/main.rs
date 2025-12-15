@@ -773,6 +773,7 @@ pub struct MartingaleStrategy {
     pub total_rewards_sol: f64,
     pub total_loss_sol: f64,
     pub last_round_id: Option<i64>,
+    pub squares: Vec<i32>, // Target squares for deployment
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -850,6 +851,7 @@ pub struct StartMartingaleRequest {
     pub wallet_address: String,
     pub base_amount_sol: f64,
     pub loss_multiplier: f64,
+    pub squares: Vec<i32>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2094,6 +2096,7 @@ pub async fn setup_database(pool: &PgPool) -> Result<(), sqlx::Error> {
             total_rewards_sol DOUBLE PRECISION DEFAULT 0,
             total_loss_sol DOUBLE PRECISION DEFAULT 0,
             last_round_id BIGINT,
+            squares INTEGER[],
             created_at TIMESTAMPTZ DEFAULT NOW(),
             updated_at TIMESTAMPTZ DEFAULT NOW()
         );
@@ -2454,6 +2457,7 @@ async fn get_active_martingale(
                 "total_rewards_sol": s.total_rewards_sol,
                 "total_loss_sol": s.total_loss_sol,
                 "last_round_id": s.last_round_id,
+                "squares": s.squares,
                 "created_at": s.created_at,
                 "updated_at": s.updated_at
             }
@@ -2609,7 +2613,8 @@ async fn get_martingale_progress(
 
                 "next_deployment": {
                     "amount_sol": s.current_amount_sol,
-                    "round_id": s.last_round_id.map(|id| id + 1)
+                    "round_id": s.last_round_id.map(|id| id + 1),
+                    "target_squares": s.squares
                 },
 
                 "totals": {
@@ -2659,6 +2664,16 @@ async fn start_martingale(
         return Err(ApiError::BadRequest("Invalid wallet address format".into()));
     }
 
+    // Validate squares
+    if payload.squares.is_empty() {
+        return Err(ApiError::BadRequest("At least one square must be specified".into()));
+    }
+    for &square in &payload.squares {
+        if square < 0 || square > 24 {
+            return Err(ApiError::BadRequest(format!("Invalid square number: {}. Must be 0-24", square)));
+        }
+    }
+
     // Get or create user
     let user = get_or_create_user(&state.db, &payload.wallet_address).await?;
 
@@ -2678,8 +2693,8 @@ async fn start_martingale(
     let strategy: MartingaleStrategy = sqlx::query_as::<_, MartingaleStrategy>(
         r#"
         INSERT INTO martingale_strategies (
-            user_id, wallet_address, base_amount_sol, loss_multiplier, current_amount_sol
-        ) VALUES ($1, $2, $3, $4, $5)
+            user_id, wallet_address, base_amount_sol, loss_multiplier, current_amount_sol, squares
+        ) VALUES ($1, $2, $3, $4, $5, $6)
         RETURNING *
         "#
     )
@@ -2688,10 +2703,11 @@ async fn start_martingale(
     .bind(payload.base_amount_sol)
     .bind(payload.loss_multiplier)
     .bind(payload.base_amount_sol) // start with base amount
+    .bind(&payload.squares)
     .fetch_one(&state.db)
     .await?;
 
-    info!("🚀 Started auto mining strategy for wallet: {} with base amount: {} SOL", payload.wallet_address, payload.base_amount_sol);
+    info!("🚀 Started auto mining strategy for wallet: {} with base amount: {} SOL, targeting {} squares", payload.wallet_address, payload.base_amount_sol, payload.squares.len());
 
     // Try initial deploy immediately
     if let Ok(board) = blockchain::get_board_info(&state.rpc_client).await {
@@ -2710,7 +2726,8 @@ async fn start_martingale(
     Ok(Json(serde_json::json!({
         "success": true,
         "strategy_id": strategy.id,
-        "message": "Auto mining strategy started - will deploy to all squares each round automatically"
+        "message": format!("Auto mining strategy started - will deploy to {} target squares each round automatically", payload.squares.len()),
+        "target_squares": payload.squares
     })))
 }
 
@@ -2744,7 +2761,7 @@ async fn start_all_active_martingale_strategies(state: Arc<AppState>) {
         let strategy_id = strategy.id;
         let wallet = strategy.wallet_address.clone();
 
-        info!("🚀 Auto-starting martingale strategy {} for wallet {}", strategy_id, wallet);
+        info!("🚀 Auto-starting martingale strategy {} for wallet {} ({} target squares)", strategy_id, wallet, strategy.squares.len());
 
         tokio::spawn(async move {
             run_auto_mining_strategy(state_clone, strategy_id).await;
@@ -2835,7 +2852,7 @@ async fn run_auto_mining_strategy(state: Arc<AppState>, strategy_id: uuid::Uuid)
 
         // Check if we need to deploy for current round
         if strategy.last_round_id != Some(board.round_id as i64) {
-            info!("🚀 Auto deploying {} SOL to all squares for round {} in strategy {}", strategy.current_amount_sol, board.round_id, strategy_id);
+            info!("🚀 Auto deploying {} SOL to {} target squares for round {} in strategy {}", strategy.current_amount_sol, strategy.squares.len(), board.round_id, strategy_id);
             if let Err(e) = deploy_for_round(&state, &strategy, board.round_id).await {
                 error!("Failed to auto deploy for strategy {}: {}", strategy_id, e);
                 // If deployment fails, stop the strategy
@@ -3028,13 +3045,14 @@ async fn deploy_for_round(
 
     // Deploy with improved error handling and auto-retry
     let amount_lamports = (strategy.current_amount_sol * blockchain::LAMPORTS_PER_SOL as f64) as u64;
-    info!("Martingale strategy {} auto-retry deploying {} lamports to all squares", strategy.id, amount_lamports);
-    
+    let target_squares: Vec<u64> = strategy.squares.iter().map(|&s| s as u64).collect();
+    info!("Martingale strategy {} auto-retry deploying {} lamports to {} target squares: {:?}", strategy.id, amount_lamports, strategy.squares.len(), strategy.squares);
+
     let _signature = match blockchain::deploy_ore_with_auto_retry(
         &state.rpc_client,
         &state.config.keypair_path,
         amount_lamports,
-        None, // deploy to all squares
+        Some(target_squares.clone()), // deploy to target squares
         0,    // no priority fee for martingale
     )
     .await {
@@ -3060,7 +3078,7 @@ async fn deploy_for_round(
     .bind(strategy.user_id)
     .bind(round_id as i64)
     .bind(amount_lamports as i64)
-    .bind(vec![0i32,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24]) // all squares
+    .bind(&strategy.squares) // use strategy's target squares
     .bind(None::<i32>)
     .execute(&state.db)
     .await?;
@@ -3075,7 +3093,7 @@ async fn deploy_for_round(
     .execute(&state.db)
     .await?;
 
-    info!("Martingale strategy {} deployed {} SOL for round {}", strategy.id, strategy.current_amount_sol, round_id);
+    info!("Martingale strategy {} deployed {} SOL to {} target squares for round {}", strategy.id, strategy.current_amount_sol, strategy.squares.len(), round_id);
 
     Ok(())
 }
