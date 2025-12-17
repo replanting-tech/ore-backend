@@ -90,13 +90,6 @@ pub struct Config {
     pub rpc_url: String,
     pub jwt_secret: String,
     pub keypair_path: String,
-    
-    // Fee optimization parameters
-    pub checkpoint_priority_fee: u64,      // Priority fee for checkpoint operations
-    pub checkpoint_compute_limit: u64,     // Compute units for checkpoint operations
-    pub checkpoint_frequency: u64,         // How often to checkpoint (every N rounds)
-    pub deploy_compute_limit: u64,         // Compute units for deploy operations
-    pub deploy_priority_fee: u64,          // Priority fee for deploy operations
 }
 
 impl Config {
@@ -108,28 +101,6 @@ impl Config {
             rpc_url: std::env::var("RPC_URL")?,
             jwt_secret: std::env::var("JWT_SECRET")?,
             keypair_path: std::env::var("KEYPAIR_PATH")?,
-            
-            // Fee optimization parameters with safe defaults
-            checkpoint_priority_fee: std::env::var("CHECKPOINT_PRIORITY_FEE")
-                .unwrap_or_else(|_| "0".to_string()) // No priority fee by default
-                .parse::<u64>()
-                .unwrap_or(0),
-            checkpoint_compute_limit: std::env::var("CHECKPOINT_COMPUTE_LIMIT")
-                .unwrap_or_else(|_| "400000".to_string()) // Reasonable compute limit
-                .parse::<u64>()
-                .unwrap_or(400_000),
-            checkpoint_frequency: std::env::var("CHECKPOINT_FREQUENCY")
-                .unwrap_or_else(|_| "3".to_string())
-                .parse::<u64>()
-                .unwrap_or(3),
-            deploy_compute_limit: std::env::var("DEPLOY_COMPUTE_LIMIT")
-                .unwrap_or_else(|_| "400000".to_string())
-                .parse::<u64>()
-                .unwrap_or(400_000),
-            deploy_priority_fee: std::env::var("DEPLOY_PRIORITY_FEE")
-                .unwrap_or_else(|_| "0".to_string())
-                .parse::<u64>()
-                .unwrap_or(0),
         })
     }
 }
@@ -1070,17 +1041,6 @@ pub mod blockchain {
     pub const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
     const TOKEN_DECIMALS: u8 = 11;
 
-    /// Check if miner should checkpoint based on frequency settings
-    pub fn should_checkpoint(miner_checkpoint_id: u64, current_round_id: u64, frequency: u64) -> bool {
-        // Always checkpoint if never checkpointed
-        if miner_checkpoint_id == 0 {
-            return true;
-        }
-        
-        // Check if enough rounds have passed since last checkpoint
-        current_round_id.saturating_sub(miner_checkpoint_id) >= frequency
-    }
-
     pub async fn get_miner_stats(
         rpc: &RpcClient,
         authority: Pubkey,
@@ -1662,8 +1622,8 @@ pub mod blockchain {
             squares,
         );
 
-        // Add optimized compute budget with configurable priority fee support
-        let compute_limit = ComputeBudgetInstruction::set_compute_unit_limit(400_000); // Optimized from 1.4M
+        // Add compute budget with priority fee support
+        let compute_limit = ComputeBudgetInstruction::set_compute_unit_limit(1_400_000);
         let compute_price = ComputeBudgetInstruction::set_compute_unit_price(priority_fee_microlamports);
 
         let blockhash = rpc.get_latest_blockhash().await?;
@@ -1729,16 +1689,6 @@ pub mod blockchain {
         };
 
         info!("Auto-retry deploying {} lamports to squares: {:?}", amount, squares.iter().enumerate().filter(|(_, &x)| x).map(|(i, _)| i).collect::<Vec<_>>());
-
-        // Calculate fee breakdown for deploy operation
-        let priority_fee_sol = priority_fee_microlamports as f64 / 1_000_000_000.0; // Convert microlamports to SOL
-        let estimated_compute_fee = 1_400_000.0 * 0.000000005; // Rough estimate for compute fees with 1.4M units
-        let total_estimated_fee = priority_fee_sol + estimated_compute_fee;
-        
-        info!("💰 DEPLOY FEE BREAKDOWN:");
-        info!("   Priority Fee: {} microlamports ({:.9} SOL)", priority_fee_microlamports, priority_fee_sol);
-        info!("   Compute Limit: {} units (est. {:.9} SOL)", 1_400_000, estimated_compute_fee);
-        info!("   Total Estimated Fee: {:.9} SOL per operation", total_estimated_fee);
 
         // Create deploy instruction
         let ix = ore_api::sdk::deploy(
@@ -1908,7 +1858,6 @@ pub mod blockchain {
         rpc: &RpcClient,
         keypair_path: &str,
         authority: Option<Pubkey>,
-        config: &Config,
     ) -> Result<String, ApiError> {
         if std::env::var("SIMULATE_ORE").unwrap_or_default() == "true" {
             return Ok("SimulatedCheckpointSignature1234567890abcdef".to_string());
@@ -1941,32 +1890,20 @@ pub mod blockchain {
         let miner = bytemuck::try_from_bytes::<ore_api::state::Miner>(miner_data)
             .map_err(|e| ApiError::Internal(format!("Failed to parse miner: {:?}", e)))?;
 
-        // Check if checkpoint is needed using smart checkpointing
-        if !should_checkpoint(miner.checkpoint_id, miner.round_id, config.checkpoint_frequency) {
-            info!("Smart checkpointing: Miner checkpoint_id={}, round_id={}, frequency={}, skipping",
-                  miner.checkpoint_id, miner.round_id, config.checkpoint_frequency);
-            return Ok(format!("Smart checkpoint skipped: {}", miner_pda.0));
+        // Check if checkpoint is needed
+        if miner.checkpoint_id >= miner.round_id {
+            info!("Miner already checkpointed for round {}, skipping", miner.round_id);
+            return Ok(format!("Already checkpointed: {}", miner_pda.0));
         }
 
-        // Calculate fee breakdown for checkpoint operation
-        let priority_fee_sol = config.checkpoint_priority_fee as f64 / 1_000_000_000.0; // Convert microlamports to SOL
-        let estimated_compute_fee = config.checkpoint_compute_limit as f64 * 0.000000005; // Rough estimate for compute fees
-        let total_estimated_fee = priority_fee_sol + estimated_compute_fee;
-        
-        info!("💰 CHECKPOINT FEE BREAKDOWN:");
-        info!("   Priority Fee: {} microlamports ({:.9} SOL)", config.checkpoint_priority_fee, priority_fee_sol);
-        info!("   Compute Limit: {} units (est. {:.9} SOL)", config.checkpoint_compute_limit, estimated_compute_fee);
-        info!("   Total Estimated Fee: {:.9} SOL per operation", total_estimated_fee);
-
-        info!("Creating checkpoint for round {} (current checkpoint: {}) with optimized fees",
-              miner.round_id, miner.checkpoint_id);
+        info!("Creating checkpoint for round {} (current checkpoint: {})", miner.round_id, miner.checkpoint_id);
 
         // Create checkpoint instruction
         let ix = ore_api::sdk::checkpoint(payer.pubkey(), authority, miner.round_id);
 
-        // Add optimized compute budget and priority fee
-        let compute_limit = ComputeBudgetInstruction::set_compute_unit_limit(config.checkpoint_compute_limit.try_into().unwrap());
-        let compute_price = ComputeBudgetInstruction::set_compute_unit_price(config.checkpoint_priority_fee);
+        // Add compute budget
+        let compute_limit = ComputeBudgetInstruction::set_compute_unit_limit(1_400_000);
+        let compute_price = ComputeBudgetInstruction::set_compute_unit_price(1_000_000);
 
         let blockhash = rpc.get_latest_blockhash().await?;
         let tx = Transaction::new_signed_with_payer(
@@ -1982,8 +1919,7 @@ pub mod blockchain {
                 ApiError::Internal(format!("Checkpoint transaction failed: {}", e))
             })?;
         
-        info!("Checkpoint transaction successful with optimized fees: {} (compute_limit={}, priority_fee={} microlamports)",
-              signature, config.checkpoint_compute_limit, config.checkpoint_priority_fee);
+        info!("Checkpoint transaction successful: {}", signature);
 
         Ok(signature.to_string())
     }
@@ -1993,7 +1929,6 @@ pub mod blockchain {
         rpc: &RpcClient,
         keypair_path: &str,
         authority: Option<Pubkey>,
-        config: &Config,
     ) -> Result<String, ApiError> {
         if std::env::var("SIMULATE_ORE").unwrap_or_default() == "true" {
             return Ok("SimulatedAutoCheckpointSignature1234567890abcdef".to_string());
@@ -2027,25 +1962,13 @@ pub mod blockchain {
         let miner = bytemuck::try_from_bytes::<ore_api::state::Miner>(miner_data)
             .map_err(|e| ApiError::Internal(format!("Failed to parse miner: {:?}", e)))?;
 
-        // Check if checkpoint is needed using smart checkpointing
-        if !should_checkpoint(miner.checkpoint_id, miner.round_id, config.checkpoint_frequency) {
-            info!("Smart auto-checkpointing: Miner checkpoint_id={}, round_id={}, frequency={}, skipping",
-                  miner.checkpoint_id, miner.round_id, config.checkpoint_frequency);
-            return Ok(format!("Smart checkpoint skipped: {}", miner_pda.0));
+        // Check if checkpoint is needed
+        if miner.checkpoint_id >= miner.round_id {
+            info!("Miner already checkpointed for round {}, skipping auto-checkpoint", miner.round_id);
+            return Ok(format!("Already checkpointed: {}", miner_pda.0));
         }
 
-        info!("Auto-checkpointing for round {} (current checkpoint: {}) with optimized fees",
-              miner.round_id, miner.checkpoint_id);
-
-        // Calculate fee breakdown for auto-checkpoint operation
-        let priority_fee_sol = config.checkpoint_priority_fee as f64 / 1_000_000_000.0; // Convert microlamports to SOL
-        let estimated_compute_fee = config.checkpoint_compute_limit as f64 * 0.000000005; // Rough estimate for compute fees
-        let total_estimated_fee = priority_fee_sol + estimated_compute_fee;
-        
-        info!("💰 AUTO-CHECKPOINT FEE BREAKDOWN:");
-        info!("   Priority Fee: {} microlamports ({:.9} SOL)", config.checkpoint_priority_fee, priority_fee_sol);
-        info!("   Compute Limit: {} units (est. {:.9} SOL)", config.checkpoint_compute_limit, estimated_compute_fee);
-        info!("   Total Estimated Fee: {:.9} SOL per operation", total_estimated_fee);
+        info!("Auto-checkpointing for round {} (current checkpoint: {})", miner.round_id, miner.checkpoint_id);
 
         // Retry logic for blockhash issues
         let mut attempts = 0;
@@ -2057,9 +1980,9 @@ pub mod blockchain {
             // Create checkpoint instruction
             let ix = ore_api::sdk::checkpoint(payer.pubkey(), authority, miner.round_id);
 
-            // Add optimized compute budget and priority fee
-            let compute_limit = ComputeBudgetInstruction::set_compute_unit_limit(config.checkpoint_compute_limit.try_into().unwrap());
-            let compute_price = ComputeBudgetInstruction::set_compute_unit_price(config.checkpoint_priority_fee);
+            // Add compute budget
+            let compute_limit = ComputeBudgetInstruction::set_compute_unit_limit(1_400_000);
+            let compute_price = ComputeBudgetInstruction::set_compute_unit_price(1_000_000);
 
             // Get fresh blockhash for each attempt
             let blockhash = rpc.get_latest_blockhash().await
@@ -2074,8 +1997,7 @@ pub mod blockchain {
 
             match rpc.send_and_confirm_transaction(&tx).await {
                 Ok(signature) => {
-                    info!("Auto-checkpoint transaction successful on attempt {} with optimized fees: {} (compute_limit={}, priority_fee={} microlamports)",
-                          attempts, signature, config.checkpoint_compute_limit, config.checkpoint_priority_fee);
+                    info!("Auto-checkpoint transaction successful on attempt {}: {}", attempts, signature);
                     return Ok(signature.to_string());
                 }
                 Err(e) => {
@@ -2413,13 +2335,13 @@ async fn deploy(
     let board = blockchain::get_board_info(&state.rpc_client).await?;
     info!("Board info: round_id={}, current_slot={}", board.round_id, board.current_slot);
 
-    // Check if miner account exists for logging purposes (no auto-checkpoint to reduce costs)
+    // Check if miner account exists before checkpointing - FIXED: Use correct wallet pubkey
     let miner_pda = ore_api::state::miner_pda(wallet_pubkey);
     let miner_exists = match state.rpc_client.get_account(&miner_pda.0).await {
         Ok(_) => true,
         Err(e) => {
             if e.to_string().contains("AccountNotFound") {
-                info!("Miner account not found for wallet: {} - will be created on deploy", payload.wallet_address);
+                info!("Miner account not found, skipping checkpoint");
                 false
             } else {
                 error!("Error checking miner account: {}", e);
@@ -2428,10 +2350,20 @@ async fn deploy(
         }
     };
 
-    // Note: Auto-checkpoint removed from deployment to reduce transaction costs
-    // Users can manually checkpoint using /api/checkpoint or the system will checkpoint periodically
     if miner_exists {
-        info!("Miner account exists for wallet: {} - proceeding with deployment (no auto-checkpoint to save fees)", payload.wallet_address);
+        info!("Auto-checkpointing miner before deploy for wallet: {}", payload.wallet_address);
+        match blockchain::auto_checkpoint_miner(&state.rpc_client, &state.config.keypair_path, Some(wallet_pubkey)).await {
+            Ok(sig) => {
+                info!("Auto-checkpoint completed: signature={}", sig);
+            }
+            Err(ApiError::Rpc(e)) => {
+                error!("Auto-checkpoint before deploy failed: {}", e);
+                return Err(handle_transaction_rpc_error(&e));
+            }
+            Err(other) => return Err(other),
+        }
+    } else {
+        info!("Skipping checkpoint - miner account doesn't exist yet for wallet: {}", payload.wallet_address);
     }
 
     // Perform blockchain deployment with auto-retry for blockhash issues
@@ -2504,7 +2436,7 @@ async fn claim(State(state): State<Arc<AppState>>) -> Result<Json<ClaimResponse>
 }
 
 async fn checkpoint(State(state): State<Arc<AppState>>) -> Result<Json<serde_json::Value>, ApiError> {
-    let signature = match blockchain::checkpoint_miner(&state.rpc_client, &state.config.keypair_path, None, &state.config).await {
+    let signature = match blockchain::checkpoint_miner(&state.rpc_client, &state.config.keypair_path, None).await {
         Ok(sig) => sig,
         Err(ApiError::Rpc(e)) => {
             error!("Checkpoint transaction failed: {}", e);
@@ -3127,9 +3059,9 @@ async fn deploy_for_round(
     let wallet_pubkey = user.wallet_address.parse::<solana_sdk::pubkey::Pubkey>()
         .map_err(|_| ApiError::Internal("Invalid wallet address in strategy".to_string()))?;
 
-    // Checkpoint miner first with optimized fees and smart checkpointing
-    info!("Martingale strategy {} auto-checkpointing miner for wallet: {} (optimized fees)", strategy.id, user.wallet_address);
-    match blockchain::auto_checkpoint_miner(&state.rpc_client, &state.config.keypair_path, Some(wallet_pubkey), &state.config).await {
+    // Checkpoint miner first - FIXED: Use correct wallet authority with auto-checkpoint
+    info!("Martingale strategy {} auto-checkpointing miner for wallet: {}", strategy.id, user.wallet_address);
+    match blockchain::auto_checkpoint_miner(&state.rpc_client, &state.config.keypair_path, Some(wallet_pubkey)).await {
         Ok(_) => {},
         Err(ApiError::Rpc(e)) => {
             error!("Martingale strategy {} auto-checkpoint failed: {}", strategy.id, e);
