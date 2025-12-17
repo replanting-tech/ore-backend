@@ -111,13 +111,13 @@ impl Config {
             
             // Fee optimization parameters with safe defaults
             checkpoint_priority_fee: std::env::var("CHECKPOINT_PRIORITY_FEE")
-                .unwrap_or_else(|_| "5000".to_string()) // 0.000005 SOL = 5,000,000 microlamports
+                .unwrap_or_else(|_| "0".to_string()) // No priority fee by default
                 .parse::<u64>()
                 .unwrap_or(0),
             checkpoint_compute_limit: std::env::var("CHECKPOINT_COMPUTE_LIMIT")
-                .unwrap_or_else(|_| "5000".to_string())
+                .unwrap_or_else(|_| "400000".to_string()) // Reasonable compute limit
                 .parse::<u64>()
-                .unwrap_or(5000),
+                .unwrap_or(400_000),
             checkpoint_frequency: std::env::var("CHECKPOINT_FREQUENCY")
                 .unwrap_or_else(|_| "3".to_string())
                 .parse::<u64>()
