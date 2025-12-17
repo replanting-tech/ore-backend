@@ -1945,7 +1945,7 @@ pub mod blockchain {
         let ix = ore_api::sdk::checkpoint(payer.pubkey(), authority, miner.round_id);
 
         // Add optimized compute budget and priority fee
-        let compute_limit = ComputeBudgetInstruction::set_compute_unit_limit(config.checkpoint_compute_limit);
+        let compute_limit = ComputeBudgetInstruction::set_compute_unit_limit(config.checkpoint_compute_limit.try_into().unwrap());
         let compute_price = ComputeBudgetInstruction::set_compute_unit_price(config.checkpoint_priority_fee);
 
         let blockhash = rpc.get_latest_blockhash().await?;
@@ -2028,7 +2028,7 @@ pub mod blockchain {
             let ix = ore_api::sdk::checkpoint(payer.pubkey(), authority, miner.round_id);
 
             // Add optimized compute budget and priority fee
-            let compute_limit = ComputeBudgetInstruction::set_compute_unit_limit(config.checkpoint_compute_limit);
+            let compute_limit = ComputeBudgetInstruction::set_compute_unit_limit(config.checkpoint_compute_limit.try_into().unwrap());
             let compute_price = ComputeBudgetInstruction::set_compute_unit_price(config.checkpoint_priority_fee);
 
             // Get fresh blockhash for each attempt
