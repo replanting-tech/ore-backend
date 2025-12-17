@@ -552,7 +552,34 @@ pub fn start_round_watcher(state: Arc<AppState>) {
                             // Send new round info immediately so clients know the next round has started
                             let board_msg = WsMessage::BoardUpdate { board: board.clone() };
                             let _ = state.broadcast.send(board_msg);
-                            
+
+                            // Ensure auto-mining is active for the new round
+                            let active_strategies: Vec<MartingaleStrategy> = match sqlx::query_as::<_, MartingaleStrategy>(
+                                "SELECT * FROM martingale_strategies WHERE status = 'active'"
+                            )
+                            .fetch_all(&state.db)
+                            .await {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    error!("Failed to load active strategies for round {}: {}", board.round_id, e);
+                                    Vec::new()
+                                }
+                            };
+
+                            for strategy in active_strategies {
+                                if strategy.last_round_id != Some(board.round_id as i64) {
+                                    info!("Ensuring auto-mining for strategy {} in round {}", strategy.id, board.round_id);
+                                    let state_clone = state.clone();
+                                    let strategy_clone = strategy.clone();
+                                    let round_id = board.round_id;
+                                    tokio::spawn(async move {
+                                        if let Err(e) = deploy_for_round(&state_clone, &strategy_clone, round_id).await {
+                                            error!("Failed to deploy for round {} in strategy {}: {}", round_id, strategy.id, e);
+                                        }
+                                    });
+                                }
+                            }
+
                             round_start_time = Some(current_time);
                         }
                     } else {
