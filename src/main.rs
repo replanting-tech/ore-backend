@@ -1730,6 +1730,16 @@ pub mod blockchain {
 
         info!("Auto-retry deploying {} lamports to squares: {:?}", amount, squares.iter().enumerate().filter(|(_, &x)| x).map(|(i, _)| i).collect::<Vec<_>>());
 
+        // Calculate fee breakdown for deploy operation
+        let priority_fee_sol = priority_fee_microlamports as f64 / 1_000_000_000.0; // Convert microlamports to SOL
+        let estimated_compute_fee = 1_400_000.0 * 0.000000005; // Rough estimate for compute fees with 1.4M units
+        let total_estimated_fee = priority_fee_sol + estimated_compute_fee;
+        
+        info!("💰 DEPLOY FEE BREAKDOWN:");
+        info!("   Priority Fee: {} microlamports ({:.9} SOL)", priority_fee_microlamports, priority_fee_sol);
+        info!("   Compute Limit: {} units (est. {:.9} SOL)", 1_400_000, estimated_compute_fee);
+        info!("   Total Estimated Fee: {:.9} SOL per operation", total_estimated_fee);
+
         // Create deploy instruction
         let ix = ore_api::sdk::deploy(
             payer.pubkey(),
@@ -1938,6 +1948,16 @@ pub mod blockchain {
             return Ok(format!("Smart checkpoint skipped: {}", miner_pda.0));
         }
 
+        // Calculate fee breakdown for checkpoint operation
+        let priority_fee_sol = config.checkpoint_priority_fee as f64 / 1_000_000_000.0; // Convert microlamports to SOL
+        let estimated_compute_fee = config.checkpoint_compute_limit as f64 * 0.000000005; // Rough estimate for compute fees
+        let total_estimated_fee = priority_fee_sol + estimated_compute_fee;
+        
+        info!("💰 CHECKPOINT FEE BREAKDOWN:");
+        info!("   Priority Fee: {} microlamports ({:.9} SOL)", config.checkpoint_priority_fee, priority_fee_sol);
+        info!("   Compute Limit: {} units (est. {:.9} SOL)", config.checkpoint_compute_limit, estimated_compute_fee);
+        info!("   Total Estimated Fee: {:.9} SOL per operation", total_estimated_fee);
+
         info!("Creating checkpoint for round {} (current checkpoint: {}) with optimized fees",
               miner.round_id, miner.checkpoint_id);
 
@@ -2016,6 +2036,16 @@ pub mod blockchain {
 
         info!("Auto-checkpointing for round {} (current checkpoint: {}) with optimized fees",
               miner.round_id, miner.checkpoint_id);
+
+        // Calculate fee breakdown for auto-checkpoint operation
+        let priority_fee_sol = config.checkpoint_priority_fee as f64 / 1_000_000_000.0; // Convert microlamports to SOL
+        let estimated_compute_fee = config.checkpoint_compute_limit as f64 * 0.000000005; // Rough estimate for compute fees
+        let total_estimated_fee = priority_fee_sol + estimated_compute_fee;
+        
+        info!("💰 AUTO-CHECKPOINT FEE BREAKDOWN:");
+        info!("   Priority Fee: {} microlamports ({:.9} SOL)", config.checkpoint_priority_fee, priority_fee_sol);
+        info!("   Compute Limit: {} units (est. {:.9} SOL)", config.checkpoint_compute_limit, estimated_compute_fee);
+        info!("   Total Estimated Fee: {:.9} SOL per operation", total_estimated_fee);
 
         // Retry logic for blockhash issues
         let mut attempts = 0;
