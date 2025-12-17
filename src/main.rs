@@ -759,7 +759,7 @@ impl IntoResponse for ApiError {
 // Models
 // ============================================================================
 
-#[derive(Debug, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct User {
     pub id: uuid::Uuid,
     pub wallet_address: String,
@@ -769,7 +769,7 @@ pub struct User {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
-#[derive(Debug, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct MiningSession {
     pub id: uuid::Uuid,
     pub user_id: uuid::Uuid,
@@ -786,7 +786,7 @@ pub struct MiningSession {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
-#[derive(Debug, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct MartingaleStrategy {
     pub id: uuid::Uuid,
     pub user_id: uuid::Uuid,
