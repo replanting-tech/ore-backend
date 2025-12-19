@@ -41,4 +41,4 @@ futures-util = { version = "0.3", features = ["sink"] }
 tokio-stream = "0.1"
 bytemuck = { version = "1.14", features = ["derive"] }
 rand = "0.8"
-steel = "4.0.5"
+steel = "4.0.4"
