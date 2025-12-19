@@ -1,233 +1,159 @@
-# ORE Mining API - Deployment Fixes Documentation
+# ORE Backend Deployment Error Fixes
 
-## Overview
+## Problem Summary
 
-This document outlines the fixes applied to the ORE Mining API deployment system to resolve issues and match the successful CLI deployment pattern.
+The error `"Error processing Instruction 2: invalid account data for instruction"` was occurring during auto-retry deploy transactions in the ORE mining backend.
 
-## Critical Fix: Blockhash Not Found Error Resolution
+## Root Cause Analysis
 
-### The Problem
-```
-{
-    "error": "Checkpoint transaction failed: RPC response error -32002: Transaction simulation failed: Blockhash not found; "
+This error indicates a **version mismatch** between:
+1. **Local ore-api SDK version** in the backend
+2. **On-chain ORE program version** on the Solana network
+
+The on-chain program expects account data in a specific format, but the local SDK was providing data in a different format, causing the program to reject the transaction.
+
+## Implemented Fixes
+
+### 1. Account Validation Before Deployment
+
+Added comprehensive account validation in all deploy functions:
+
+```rust
+// Validate miner account exists and has correct data size
+let miner_pda = ore_api::state::miner_pda(payer.pubkey());
+match rpc.get_account(&miner_pda.0).await {
+    Ok(account) => {
+        let miner_size = std::mem::size_of::<ore_api::state::Miner>();
+        if account.data.len() < 8 + miner_size {
+            return Err(ApiError::Internal(format!(
+                "Miner account data too small: expected at least {} bytes, got {}",
+                8 + miner_size, 
+                account.data.len()
+            )));
+        }
+        
+        // Try to deserialize miner data to validate structure
+        let miner_data = &account.data[8..8 + miner_size];
+        match bytemuck::try_from_bytes::<ore_api::state::Miner>(miner_data) {
+            Ok(miner) => {
+                info!("Miner account validated: round_id={}, checkpoint_id={}, rewards_sol={}", 
+                      miner.round_id, miner.checkpoint_id, miner.rewards_sol);
+            }
+            Err(e) => {
+                error!("Failed to deserialize miner account data: {:?}", e);
+                return Err(ApiError::Internal(format!("Invalid miner account data: {:?}", e)));
+            }
+        }
+    }
+    Err(e) => {
+        if e.to_string().contains("AccountNotFound") {
+            info!("Miner account doesn't exist yet, will be created on first deploy");
+        } else {
+            error!("Failed to get miner account: {}", e);
+            return Err(ApiError::Rpc(e));
+        }
+    }
 }
 ```
 
-**Root Cause**: Solana blockhashes expire after ~60-90 seconds. When the API performs a checkpoint transaction, it:
-1. Gets a blockhash
-2. Creates and signs the transaction
-3. But by the time it tries to send it, the blockhash has expired
+### 2. Enhanced Error Handling
 
-### The Solution: Auto-Checkpoint with Blockhash Refresh
+Added specific error detection and detailed logging:
 
-**NEW: `auto_checkpoint_miner()` function:**
-- ✅ Gets fresh blockhash right before sending each transaction
-- ✅ Implements retry logic (up to 3 attempts) when blockhash expires
-- ✅ Automatically skips checkpoint if already done for current round
-- ✅ Handles missing miner accounts gracefully
-
-**NEW: `deploy_ore_with_auto_retry()` function:**
-- ✅ Gets fresh blockhash right before sending each deployment transaction
-- ✅ Implements retry logic (up to 3 attempts) when blockhash expires
-- ✅ Maintains priority fee = 0 to match CLI behavior
-
-### How It Works Now
-
-1. **Auto-Checkpoint** (before deploy):
-   - Checks if miner needs checkpointing
-   - Gets fresh blockhash
-   - Sends checkpoint transaction
-   - Retries up to 3 times if blockhash expires
-
-2. **Auto-Retry Deploy**:
-   - Gets fresh blockhash
-   - Sends deployment transaction
-   - Retries up to 3 times if blockhash expires
-
-**Result**: No more "Blockhash not found" errors! 🎉
-
-## Issues Fixed
-
-### 1. **Auto-Checkpoint Implementation**
-- **Problem**: "Blockhash not found" errors during checkpoint transactions due to expired blockhashes
-- **Fix**: Implemented `auto_checkpoint_miner()` function with automatic blockhash refresh and retry logic
-- **Impact**: Prevents checkpoint transaction failures and ensures reliable auto-checkpointing
-
-### 2. **Auto-Retry Deployment System**
-- **Problem**: "Blockhash not found" errors during deployment transactions due to expired blockhashes
-- **Fix**: Implemented `deploy_ore_with_auto_retry()` function with automatic blockhash refresh and retry logic
-- **Impact**: Prevents deployment transaction failures with automatic retry on blockhash expiration
-
-### 3. **Miner PDA Calculation Error**
-- **Problem**: The API was incorrectly parsing the keypair path as a wallet pubkey when checking miner accounts
-- **Fix**: Now correctly parses the wallet address from the request to calculate the miner PDA
-- **Impact**: Prevents checkpoint failures due to wrong wallet references
-
-### 4. **Priority Fee Support**
-- **Problem**: API didn't support priority fees like the CLI does
-- **Fix**: Added `deploy_ore_with_priority_fee` function with priority fee parameter
-- **Impact**: Now matches CLI behavior with `PRIORITY_FEE=0` support
-
-### 5. **Square Validation Enhancement**
-- **Problem**: Square ID validation was insufficient
-- **Fix**: Added proper validation for square IDs (0-24) and ensured at least one square is selected
-- **Impact**: Prevents invalid square selections that could cause transaction failures
-
-### 6. **Enhanced Logging and Error Handling**
-- **Problem**: Limited logging made debugging deployment issues difficult
-- **Fix**: Added comprehensive logging throughout deployment process
-- **Impact**: Better visibility into deployment flow and easier troubleshooting
-
-## Key Changes
-
-### New Function: `auto_checkpoint_miner`
 ```rust
-pub async fn auto_checkpoint_miner(
-    rpc: &RpcClient,
-    keypair_path: &str,
-    authority: Option<Pubkey>,
-) -> Result<String, ApiError>
-```
-- Automatically handles blockhash refresh for checkpoint transactions
-- Implements retry logic (up to 3 attempts) for "Blockhash not found" errors
-- Prevents checkpoint failures due to expired blockhashes
-
-### New Function: `deploy_ore_with_auto_retry`
-```rust
-pub async fn deploy_ore_with_auto_retry(
-    rpc: &RpcClient,
-    keypair_path: &str,
-    amount: u64,
-    square_ids: Option<Vec<u64>>,
-    priority_fee_microlamports: u64,
-) -> Result<String, ApiError>
-```
-- Automatically handles blockhash refresh for deployment transactions
-- Implements retry logic (up to 3 attempts) for "Blockhash not found" errors
-- Prevents deployment failures due to expired blockhashes
-
-### Updated Deploy Function
-- Now uses `auto_checkpoint_miner()` for automatic checkpointing
-- Now uses `deploy_ore_with_auto_retry()` for deployment with retry logic
-- Fixed miner PDA calculation using correct wallet address
-- Enhanced error handling and logging
-
-### Updated Martingale Deployment
-- Fixed checkpoint authority to use correct wallet
-- Uses improved auto-checkpoint and auto-retry deployment functions
-- Better error handling and logging
-
-## CLI Compatibility
-
-The API now matches the CLI deployment pattern:
-
-### CLI Pattern (Working):
-```bash
-# 1. Checkpoint
-KEYPAIR=~/.config/solana/id.json RPC=https://api.mainnet-beta.solana.com COMMAND=checkpoint cargo run --release --bin ore-cli
-
-# 2. Deploy
-PRIORITY_FEE=0 KEYPAIR=~/.config/solana/id.json RPC=https://api.mainnet-beta.solana.com COMMAND=deploy AMOUNT=10000 SQUARE=0,1,2,4,7,9,10,11,12,13,14,15,17,20,22,23,24 cargo run --release --bin ore-cli
-```
-
-### API Pattern (Now Fixed with Auto-Checkpoint):
-```javascript
-// Deploy endpoint now automatically handles:
-// 1. Auto-checkpoint with blockhash refresh and retry
-// 2. Auto-retry deployment with blockhash refresh
-// 3. Priority fee = 0 (matching CLI)
-
-POST /api/deploy
-{
-  "wallet_address": "...",
-  "amount": 10000,
-  "square_ids": [0,1,2,4,7,9,10,11,12,13,14,15,17,20,22,23,24]
+if error_msg.contains("invalid account data for instruction") {
+    error!("ACCOUNT DATA VALIDATION ERROR - This indicates a serious issue:");
+    error!("1. ore-api SDK version is incompatible with on-chain program");
+    error!("2. Account data structure doesn't match program expectations");
+    error!("3. Account corruption or wrong PDA derivations");
+    error!("4. Program state inconsistencies");
+    error!("IMMEDIATE ACTION REQUIRED: Update ore-api dependency and verify network compatibility");
+    
+    // Return immediately for account data errors - no point retrying
+    return Err(ApiError::Internal(format!(
+        "Account data validation failed: SDK/program version mismatch detected. Please update ore-api dependency. Original error: {}", e
+    )));
 }
-
-// Manual checkpoint still available (with auto-retry)
-POST /api/checkpoint
 ```
 
-**What happens automatically:**
-1. **Auto-Checkpoint**: Checks if miner needs checkpoint, performs it with retry logic
-2. **Blockhash Refresh**: Gets fresh blockhash before each transaction attempt
-3. **Auto-Retry**: Retries up to 3 times if blockhash expires
-4. **Deploy**: Performs deployment with retry logic
+### 3. Dependency Updates
 
-## Testing the Fixes
+Updated `Cargo.toml` to use compatible versions:
 
-### 1. Test Individual Endpoints
+```toml
+# Updated steel version for better Solana v2 compatibility
+steel = "4.0.5"
+```
 
-**Checkpoint Test:**
+### 4. Function Coverage
+
+Applied fixes to all deploy functions:
+- `deploy_ore()` - Basic deploy function
+- `deploy_ore_with_priority_fee()` - Deploy with priority fees
+- `deploy_ore_with_auto_retry()` - Auto-retry deploy (main function used by martingale)
+
+## How to Apply the Fix
+
+### Step 1: Update Dependencies
+
 ```bash
-curl -X POST http://localhost:3000/api/checkpoint \
-  -H "Content-Type: application/json"
+# Update the ore-api local dependency
+cargo update
+
+# Clean and rebuild to ensure fresh dependencies
+cargo clean
+cargo build
 ```
 
-**Deploy Test:**
+### Step 2: Verify Network Compatibility
+
+Check that your local ore-api version matches the on-chain program:
+
 ```bash
-curl -X POST http://localhost:3000/api/deploy \
-  -H "Content-Type: application/json" \
-  -d '{
-    "wallet_address": "YourWalletAddress",
-    "amount": 10000,
-    "square_ids": [0,1,2,4,7,9,10,11,12,13,14,15,17,20,22,23,24]
-  }'
+# Check ore-cli version
+ore --version
+
+# Verify against network
+ore program info
 ```
 
-### 2. Test Square Validation
-Try invalid square IDs to ensure proper validation:
-```bash
-curl -X POST http://localhost:3000/api/deploy \
-  -H "Content-Type: application/json" \
-  -d '{
-    "wallet_address": "YourWalletAddress",
-    "amount": 10000,
-    "square_ids": [25, 30]  # Should fail - invalid IDs
-  }'
-```
+### Step 3: Test Deployment
 
-### 3. Check Logs
-Monitor application logs for deployment flow:
-```bash
-# Check for deployment logs showing:
-# - Correct miner PDA calculation
-# - Priority fee usage (0 microlamports)
-# - Square validation results
-# - Transaction success confirmations
-```
+1. Start the backend server
+2. Test a small deployment to verify account validation passes
+3. Monitor logs for validation messages
 
-## Environment Variables
+## Expected Behavior After Fix
 
-Ensure these are set correctly:
-```bash
-RPC_URL=https://api.mainnet-beta.solana.com
-KEYPAIR_PATH=~/.config/solana/id.json
-DATABASE_URL=postgresql://...
-REDIS_URL=redis://...
-```
+1. **Pre-deployment validation** will catch account data issues before sending transactions
+2. **Detailed error messages** will help identify version mismatches
+3. **Early error detection** prevents unnecessary transaction attempts
+4. **Better logging** provides clear guidance for resolution
 
-## Monitoring
+## Troubleshooting
 
-Watch for these log messages to confirm fixes are working:
+If the error persists:
 
-1. **Auto-Checkpoint**: `"Auto-checkpointing miner before deploy for wallet: [address]"` or `"Auto-checkpoint completed: [signature]"`
-2. **Blockhash Retry**: `"Blockhash expired on attempt X, retrying with fresh blockhash"`
-3. **Auto-Retry Deploy**: `"Auto-retry deploying [amount] lamports to squares: [list]"`
-4. **Transaction Success**: `"Auto-retry deploy transaction confirmed on attempt X: [signature]"`
-5. **Already Checkpointed**: `"Miner already checkpointed for round X, skipping auto-checkpoint"`
+1. **Check ore-api version**: Ensure local ore-api matches the on-chain program
+2. **Verify network**: Confirm you're connecting to the correct network (mainnet/devnet)
+3. **Account state**: Ensure miner accounts are properly initialized
+4. **Program updates**: Check if the ORE program was recently updated
 
-## Rollback Plan
+## Prevention
 
-If issues arise, the previous deployment functions (`deploy_ore_multiple`, original checkpoint logic) are still available and can be reverted by:
-1. Updating the deploy function to call `deploy_ore_multiple` instead of `deploy_ore_with_priority_fee`
-2. Reverting checkpoint logic to use `None` authority parameter
+To prevent similar issues in the future:
 
-## Next Steps
+1. **Version pinning**: Pin ore-api versions in Cargo.toml
+2. **Compatibility testing**: Test against different network environments
+3. **Account validation**: Always validate account data before transactions
+4. **Monitoring**: Log detailed information about account states
 
-1. ✅ **Auto-Checkpoint Implemented**: Now automatically handles blockhash refresh for checkpoint transactions
-2. ✅ **Auto-Retry Deployment**: Now automatically retries deployment on blockhash expiration
-3. Test on mainnet with small amounts
-4. Monitor transaction success rates and retry counts
-5. Consider adding deployment queue for high-volume scenarios
-6. Consider implementing priority fee optimization based on network conditions
+## Files Modified
+
+- `Cargo.toml` - Updated steel dependency version
+- `src/main.rs` - Added account validation and enhanced error handling
+  - `deploy_ore()` function
+  - `deploy_ore_with_priority_fee()` function  
+  - `deploy_ore_with_auto_retry()` function
+
+The fixes ensure robust deployment with early error detection and clear error messages for debugging version compatibility issues.

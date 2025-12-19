@@ -1511,6 +1511,44 @@ pub mod blockchain {
             [true; 25] // Deploy to all squares if none specified
         };
 
+        // Account validation before deployment
+        let miner_pda = ore_api::state::miner_pda(payer.pubkey());
+        info!("Validating miner account at: {}", miner_pda.0);
+        
+        match rpc.get_account(&miner_pda.0).await {
+            Ok(account) => {
+                let miner_size = std::mem::size_of::<ore_api::state::Miner>();
+                if account.data.len() < 8 + miner_size {
+                    return Err(ApiError::Internal(format!(
+                        "Miner account data too small: expected at least {} bytes, got {}",
+                        8 + miner_size,
+                        account.data.len()
+                    )));
+                }
+                
+                // Try to deserialize miner data to validate structure
+                let miner_data = &account.data[8..8 + miner_size];
+                match bytemuck::try_from_bytes::<ore_api::state::Miner>(miner_data) {
+                    Ok(miner) => {
+                        info!("Miner account validated: round_id={}, checkpoint_id={}, rewards_sol={}",
+                              miner.round_id, miner.checkpoint_id, miner.rewards_sol);
+                    }
+                    Err(e) => {
+                        error!("Failed to deserialize miner account data: {:?}", e);
+                        return Err(ApiError::Internal(format!("Invalid miner account data: {:?}", e)));
+                    }
+                }
+            }
+            Err(e) => {
+                if e.to_string().contains("AccountNotFound") {
+                    info!("Miner account doesn't exist yet, will be created on first deploy");
+                } else {
+                    error!("Failed to get miner account: {}", e);
+                    return Err(ApiError::Rpc(e));
+                }
+            }
+        }
+
         // Add deploy instruction
         let deploy_ix = ore_api::sdk::deploy(
             payer.pubkey(),
@@ -1538,7 +1576,22 @@ pub mod blockchain {
         );
 
         let signature = rpc.send_and_confirm_transaction(&tx).await
-            .map_err(|e| ApiError::Internal(format!("Transaction failed: {}", e)))?;
+            .map_err(|e| {
+                error!("Transaction failed with detailed error: {}", e);
+                
+                // Enhanced error logging for "invalid account data" errors
+                let error_str = e.to_string();
+                if error_str.contains("invalid account data for instruction") {
+                    error!("ACCOUNT DATA ERROR: This typically indicates:");
+                    error!("1. ore-api SDK version mismatch with on-chain program");
+                    error!("2. Corrupted account data structure");
+                    error!("3. Wrong account PDA derivations");
+                    error!("4. Program expects different account layout");
+                    error!("SOLUTION: Update ore-api dependency and verify account initialization");
+                }
+                
+                ApiError::Internal(format!("Transaction failed: {}", e))
+            })?;
         
         info!("Deploy transaction successful: signature={}", signature);
 
@@ -1610,6 +1663,44 @@ pub mod blockchain {
         } else {
             [true; 25]  // Default: semua squares
         };
+
+        // Account validation before deployment
+        let miner_pda = ore_api::state::miner_pda(payer.pubkey());
+        info!("Validating miner account at: {}", miner_pda.0);
+        
+        match rpc.get_account(&miner_pda.0).await {
+            Ok(account) => {
+                let miner_size = std::mem::size_of::<ore_api::state::Miner>();
+                if account.data.len() < 8 + miner_size {
+                    return Err(ApiError::Internal(format!(
+                        "Miner account data too small: expected at least {} bytes, got {}",
+                        8 + miner_size,
+                        account.data.len()
+                    )));
+                }
+                
+                // Try to deserialize miner data to validate structure
+                let miner_data = &account.data[8..8 + miner_size];
+                match bytemuck::try_from_bytes::<ore_api::state::Miner>(miner_data) {
+                    Ok(miner) => {
+                        info!("Miner account validated: round_id={}, checkpoint_id={}, rewards_sol={}",
+                              miner.round_id, miner.checkpoint_id, miner.rewards_sol);
+                    }
+                    Err(e) => {
+                        error!("Failed to deserialize miner account data: {:?}", e);
+                        return Err(ApiError::Internal(format!("Invalid miner account data: {:?}", e)));
+                    }
+                }
+            }
+            Err(e) => {
+                if e.to_string().contains("AccountNotFound") {
+                    info!("Miner account doesn't exist yet, will be created on first deploy");
+                } else {
+                    error!("Failed to get miner account: {}", e);
+                    return Err(ApiError::Rpc(e));
+                }
+            }
+        }
 
         info!("Deploying {} lamports to squares: {:?}", amount, squares.iter().enumerate().filter(|(_, &x)| x).map(|(i, _)| i).collect::<Vec<_>>());
 
@@ -1688,6 +1779,58 @@ pub mod blockchain {
             [true; 25]  // Default: semua squares
         };
 
+        // Account validation before deployment
+        let miner_pda = ore_api::state::miner_pda(payer.pubkey());
+        info!("Validating miner account at: {}", miner_pda.0);
+        
+        match rpc.get_account(&miner_pda.0).await {
+            Ok(account) => {
+                let miner_size = std::mem::size_of::<ore_api::state::Miner>();
+                if account.data.len() < 8 + miner_size {
+                    return Err(ApiError::Internal(format!(
+                        "Miner account data too small: expected at least {} bytes, got {}",
+                        8 + miner_size,
+                        account.data.len()
+                    )));
+                }
+                
+                // Try to deserialize miner data to validate structure
+                let miner_data = &account.data[8..8 + miner_size];
+                match bytemuck::try_from_bytes::<ore_api::state::Miner>(miner_data) {
+                    Ok(miner) => {
+                        info!("Miner account validated: round_id={}, checkpoint_id={}, rewards_sol={}",
+                              miner.round_id, miner.checkpoint_id, miner.rewards_sol);
+                    }
+                    Err(e) => {
+                        error!("Failed to deserialize miner account data: {:?}", e);
+                        return Err(ApiError::Internal(format!("Invalid miner account data: {:?}", e)));
+                    }
+                }
+            }
+            Err(e) => {
+                if e.to_string().contains("AccountNotFound") {
+                    info!("Miner account doesn't exist yet, will be created on first deploy");
+                } else {
+                    error!("Failed to get miner account: {}", e);
+                    return Err(ApiError::Rpc(e));
+                }
+            }
+        }
+
+        // Validate board account
+        info!("Validating board account at: {}", board_pda.0);
+        let board_account = rpc.get_account(&board_pda.0).await
+            .map_err(|e| ApiError::Internal(format!("Failed to get board account: {}", e)))?;
+        
+        let board_size = std::mem::size_of::<ore_api::state::Board>();
+        if board_account.data.len() < 8 + board_size {
+            return Err(ApiError::Internal(format!(
+                "Board account data too small: expected at least {} bytes, got {}",
+                8 + board_size,
+                board_account.data.len()
+            )));
+        }
+
         info!("Auto-retry deploying {} lamports to squares: {:?}", amount, squares.iter().enumerate().filter(|(_, &x)| x).map(|(i, _)| i).collect::<Vec<_>>());
 
         // Create deploy instruction
@@ -1731,6 +1874,21 @@ pub mod blockchain {
                 Err(e) => {
                     let error_msg = e.to_string();
                     
+                    // Enhanced error handling for specific error types
+                    if error_msg.contains("invalid account data for instruction") {
+                        error!("ACCOUNT DATA VALIDATION ERROR - This indicates a serious issue:");
+                        error!("1. ore-api SDK version is incompatible with on-chain program");
+                        error!("2. Account data structure doesn't match program expectations");
+                        error!("3. Account corruption or wrong PDA derivations");
+                        error!("4. Program state inconsistencies");
+                        error!("IMMEDIATE ACTION REQUIRED: Update ore-api dependency and verify network compatibility");
+                        
+                        // Return immediately for account data errors - no point retrying
+                        return Err(ApiError::Internal(format!(
+                            "Account data validation failed: SDK/program version mismatch detected. Please update ore-api dependency. Original error: {}", e
+                        )));
+                    }
+                    
                     // Check if it's a blockhash error and we have more attempts
                     if (error_msg.contains("BlockhashNotFound") || error_msg.contains("blockhash not found")) && attempts < max_attempts {
                         warn!("Blockhash expired on deploy attempt {}, retrying with fresh blockhash (attempt {}/{})",
@@ -1739,6 +1897,16 @@ pub mod blockchain {
                         // Short delay before retry
                         sleep(Duration::from_millis(100)).await;
                         continue;
+                    }
+                    
+                    // Check if it's an instruction error and provide detailed info
+                    if error_msg.contains("Error processing Instruction") {
+                        error!("INSTRUCTION PROCESSING ERROR:");
+                        error!("This could indicate:");
+                        error!("1. Invalid instruction parameters");
+                        error!("2. Account permissions issues");
+                        error!("3. Program state inconsistencies");
+                        error!("4. Network/mainnet version mismatch");
                     }
                     
                     error!("Auto-retry deploy transaction failed after {} attempts: {}", attempts, error_msg);
