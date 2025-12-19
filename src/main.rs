@@ -22,6 +22,7 @@ use tracing::{debug, info, error, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use tokio::time::{sleep, Duration};
 use uuid::Uuid;
+use solana_sdk::pubkey::Pubkey;
 
 // ============================================================================
 // WebSocket Message Types
@@ -1062,8 +1063,8 @@ pub mod blockchain {
         signature::{read_keypair_file, Signer},
         transaction::Transaction,
         compute_budget::ComputeBudgetInstruction,
-        system_instruction,
     };
+    use solana_system_interface::instruction as system_instruction;
     // use std::str::FromStr;
 
     pub const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
