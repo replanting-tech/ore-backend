@@ -1063,8 +1063,8 @@ pub mod blockchain {
         signature::{read_keypair_file, Signer},
         transaction::Transaction,
         compute_budget::ComputeBudgetInstruction,
+        system_instruction,
     };
-    use solana_system_interface::instruction as system_instruction;
     // use std::str::FromStr;
 
     pub const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
