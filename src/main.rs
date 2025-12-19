@@ -435,7 +435,7 @@ pub fn start_update_broadcaster(state: Arc<AppState>) {
                 let seconds = (time_remaining % 60.0) as u64;
                 let _current_seconds = chrono::Utc::now().timestamp();
                 
-                info!("⏰ ROUND {} | ⏱️  Time Remaining: {}:{:02} ({} seconds) | 🎯 Current Slot: {} | 📊 Live Countdown",
+                info!("⏰ ROUND {} | ⏱️  Time Remaining: {}:{:02} ({} seconds) | 🎯 Current Slot: {}",
                       board.round_id,
                       minutes,
                       seconds,
@@ -566,7 +566,32 @@ pub fn start_round_watcher(state: Arc<AppState>) {
                                 }
                             };
 
-                            for strategy in active_strategies {
+                            for mut strategy in active_strategies {
+                                // Increment rounds since last claim
+                                strategy.rounds_since_last_claim += 1;
+                                
+                                if strategy.rounds_since_last_claim >= strategy.auto_claim_rounds {
+                                    info!("🔄 AUTO-CLAIM: Strategy {} reached {} rounds, triggering claim", strategy.id, strategy.auto_claim_rounds);
+                                    let state_clone = state.clone();
+                                    let wallet_address = strategy.wallet_address.clone();
+                                    tokio::spawn(async move {
+                                        if let Ok(pubkey) = wallet_address.parse::<Pubkey>() {
+                                            match blockchain::claim_rewards(&state_clone.rpc_client, &state_clone.config.keypair_path, Some(pubkey)).await {
+                                                Ok(res) => info!("✅ Auto-claimed {} SOL and {} ORE for {}", res.sol_claimed, res.ore_claimed, wallet_address),
+                                                Err(e) => error!("❌ Auto-claim failed for {}: {}", wallet_address, e),
+                                            }
+                                        }
+                                    });
+                                    strategy.rounds_since_last_claim = 0;
+                                }
+
+                                // Update the strategy in the database
+                                let _ = sqlx::query("UPDATE martingale_strategies SET rounds_since_last_claim = $1 WHERE id = $2")
+                                    .bind(strategy.rounds_since_last_claim)
+                                    .bind(strategy.id)
+                                    .execute(&state.db)
+                                    .await;
+
                                 if strategy.last_round_id != Some(board.round_id as i64) {
                                     info!("Ensuring auto-mining for strategy {} in round {}", strategy.id, board.round_id);
                                     let state_clone = state.clone();
@@ -801,6 +826,8 @@ pub struct MartingaleStrategy {
     pub total_loss_sol: f64,
     pub last_round_id: Option<i64>,
     pub squares: Vec<i32>, // Target squares for deployment
+    pub auto_claim_rounds: i32,
+    pub rounds_since_last_claim: i32,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -1035,6 +1062,7 @@ pub mod blockchain {
         signature::{read_keypair_file, Signer},
         transaction::Transaction,
         compute_budget::ComputeBudgetInstruction,
+        system_instruction,
     };
     // use std::str::FromStr;
 
@@ -1743,13 +1771,33 @@ pub mod blockchain {
         amount: u64,
         square_ids: Option<Vec<u64>>,
         priority_fee_microlamports: u64,
+        pool: Option<&PgPool>,
     ) -> Result<String, ApiError> {
         if std::env::var("SIMULATE_ORE").unwrap_or_default() == "true" {
+            info!("💰 SIMULATED DEPLOY BUDGET:");
+            info!("   🔹 Amount: {} lamports", amount);
+            info!("   🔹 Fee: 2000 lamports");
             return Ok("SimulatedAutoDeploySignature1234567890abcdef".to_string());
         }
 
         let payer = read_keypair_file(keypair_path)
             .map_err(|e| ApiError::BadRequest(format!("Keypair error: {}", e)))?;
+
+        // Transfer fee to maintenance wallet
+        let maintenance_wallet: Pubkey = "HBEtoXXdPFXAAnob8zEmUTVJtWmoibwBBHbisjFSroHu".parse().unwrap();
+        let fee_amount = 2_000; // 0.000002 SOL
+        let fee_ix = system_instruction::transfer(
+            &payer.pubkey(),
+            &maintenance_wallet,
+            fee_amount,
+        );
+
+        let total_cost_sol = (amount + fee_amount) as f64 / LAMPORTS_PER_SOL as f64;
+        info!("💰 OPERATION BUDGET MONITORING:");
+        info!("   🔹 Deploy Amount:  {} lamports ({} SOL)", amount, amount as f64 / LAMPORTS_PER_SOL as f64);
+        info!("   🔹 Priority Fee:   {} microlamports", priority_fee_microlamports);
+        info!("   🔹 Transfer Fee:   {} lamports (0.000002 SOL)", fee_amount);
+        info!("   🔹 Total Base Cost: {} lamports ({} SOL)", amount + fee_amount, total_cost_sol);
 
         let board_pda = ore_api::state::board_pda();
         let account = rpc.get_account(&board_pda.0).await?;
@@ -1858,7 +1906,7 @@ pub mod blockchain {
                 .map_err(|e| ApiError::Internal(format!("Failed to get fresh blockhash: {}", e)))?;
 
             let tx = Transaction::new_signed_with_payer(
-                &[compute_limit.clone(), compute_price.clone(), ix.clone()],
+                &[compute_limit.clone(), compute_price.clone(), fee_ix.clone(), ix.clone()],
                 Some(&payer.pubkey()),
                 &[&payer],
                 blockhash,
@@ -1869,6 +1917,20 @@ pub mod blockchain {
             match rpc.send_and_confirm_transaction(&tx).await {
                 Ok(signature) => {
                     info!("Auto-retry deploy transaction confirmed on attempt {}: {}", attempts, signature);
+                    
+                    // Save fee history if pool is provided
+                    if let Some(p) = pool {
+                        let _ = sqlx::query(
+                            "INSERT INTO fee_history (wallet_address, amount_sol, signature, operation_type) VALUES ($1, $2, $3, $4)"
+                        )
+                        .bind(payer.pubkey().to_string())
+                        .bind(fee_amount as f64 / LAMPORTS_PER_SOL as f64)
+                        .bind(signature.to_string())
+                        .bind("deploy")
+                        .execute(p)
+                        .await;
+                    }
+
                     return Ok(signature.to_string());
                 }
                 Err(e) => {
@@ -1919,6 +1981,7 @@ pub mod blockchain {
         pub async fn claim_rewards(
         rpc: &RpcClient,
         keypair_path: &str,
+        authority: Option<Pubkey>,
     ) -> Result<ClaimResponse, ApiError> {
         if std::env::var("SIMULATE_ORE").unwrap_or_default() == "true" {
             return Ok(ClaimResponse {
@@ -1931,14 +1994,21 @@ pub mod blockchain {
         let payer = read_keypair_file(keypair_path)
             .map_err(|e| ApiError::BadRequest(format!("Keypair error: {}", e)))?;
 
+        let authority = authority.unwrap_or(payer.pubkey());
+
         // Get current rewards
-        let stats = get_miner_stats(rpc, payer.pubkey()).await?;
+        let stats = get_miner_stats(rpc, authority).await?;
         let sol_claimed = stats.rewards_sol;
         let ore_claimed = stats.rewards_ore;
 
+        info!("💰 CLAIM BUDGET MONITORING:");
+        info!("   🔹 Target Wallet:  {}", authority);
+        info!("   🔹 Expected SOL:   {} lamports", sol_claimed);
+        info!("   🔹 Expected ORE:   {} base units", ore_claimed);
+
         // Create claim instructions
-        let ix_sol = ore_api::sdk::claim_sol(payer.pubkey());
-        let ix_ore = ore_api::sdk::claim_ore(payer.pubkey());
+        let ix_sol = ore_api::sdk::claim_sol(authority);
+        let ix_ore = ore_api::sdk::claim_ore(authority);
 
         // Add compute budget
         let compute_limit = ComputeBudgetInstruction::set_compute_unit_limit(1_400_000);
@@ -2014,6 +2084,10 @@ pub mod blockchain {
                     blockhash,
                 );
 
+                info!("💰 REGISTER BUDGET MONITORING:");
+                info!("   🔹 Initial Deploy:  {} lamports", minimal_amount);
+                info!("   🔹 Priority Fee:   1,000,000 microlamports");
+
                 let signature = rpc.send_and_confirm_transaction(&tx).await?;
                 info!("Initialized miner account with transaction: {}", signature);
 
@@ -2080,6 +2154,9 @@ pub mod blockchain {
             &[&payer],
             blockhash,
         );
+
+        info!("💰 CHECKPOINT BUDGET MONITORING:");
+        info!("   🔹 Priority Fee:   1,000,000 microlamports");
 
         let signature = rpc.send_and_confirm_transaction(&tx).await
             .map_err(|e| {
@@ -2162,6 +2239,9 @@ pub mod blockchain {
                 &[&payer],
                 blockhash,
             );
+
+            info!("💰 AUTO-CHECKPOINT BUDGET MONITORING:");
+            info!("   🔹 Priority Fee:   1,000,000 microlamports (Attempt {})", attempts);
 
             match rpc.send_and_confirm_transaction(&tx).await {
                 Ok(signature) => {
@@ -2292,9 +2372,24 @@ pub async fn setup_database(pool: &PgPool) -> Result<(), sqlx::Error> {
             total_loss_sol DOUBLE PRECISION DEFAULT 0,
             last_round_id BIGINT,
             squares INTEGER[],
+            auto_claim_rounds INTEGER DEFAULT 5,
+            rounds_since_last_claim INTEGER DEFAULT 0,
             created_at TIMESTAMPTZ DEFAULT NOW(),
             updated_at TIMESTAMPTZ DEFAULT NOW()
         );
+
+        CREATE TABLE IF NOT EXISTS fee_history (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            wallet_address VARCHAR(44) NOT NULL,
+            amount_sol DOUBLE PRECISION NOT NULL,
+            signature VARCHAR(88) NOT NULL,
+            operation_type VARCHAR(50) NOT NULL,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        );
+
+        -- Add columns if they don't exist for existing tables
+        sqlx::query("ALTER TABLE martingale_strategies ADD COLUMN IF NOT EXISTS auto_claim_rounds INTEGER DEFAULT 5").execute(&pool).await?;
+        sqlx::query("ALTER TABLE martingale_strategies ADD COLUMN IF NOT EXISTS rounds_since_last_claim INTEGER DEFAULT 0").execute(&pool).await?;
 
         CREATE INDEX IF NOT EXISTS idx_sessions_user ON mining_sessions(user_id);
         CREATE INDEX IF NOT EXISTS idx_sessions_round ON mining_sessions(round_id);
@@ -2542,6 +2637,7 @@ async fn deploy(
         payload.amount,
         payload.square_ids.clone(),
         0, // priority fee set to 0 to match CLI
+        Some(&state.db),
     )
     .await {
         Ok(sig) => sig,
@@ -2592,7 +2688,7 @@ async fn deploy(
 }
 
 async fn claim(State(state): State<Arc<AppState>>) -> Result<Json<ClaimResponse>, ApiError> {
-    let response = match blockchain::claim_rewards(&state.rpc_client, &state.config.keypair_path).await {
+    let response = match blockchain::claim_rewards(&state.rpc_client, &state.config.keypair_path, None).await {
         Ok(res) => res,
         Err(ApiError::Rpc(e)) => {
             error!("Claim transaction failed: {}", e);
@@ -3249,6 +3345,7 @@ async fn deploy_for_round(
         amount_lamports,
         Some(target_squares.clone()), // deploy to target squares
         0,    // no priority fee for martingale
+        Some(&state.db),
     )
     .await {
         Ok(sig) => {
@@ -3679,7 +3776,7 @@ async fn main() -> Result<(), anyhow::Error> {
     
     info!("👀 ROUND WATCHER ACTIVE - Watch the logs tick by tick!");
     info!("🔍 Look for these log patterns:");
-    info!("   ⏰ ROUND X | Time Remaining: M:SS (N seconds) | Live Countdown");
+    info!("   ⏰ ROUND X | Time Remaining: M:SS (N seconds)");
     info!("   📊 ROUND X PROGRESS REPORT (every 10 seconds)");
     info!("   ⚠️  ROUND X ENDS IN Y SECONDS! (final 30 seconds)");
     info!("   🚨 ROUND X FINAL COUNTDOWN: Z! (last 5 seconds)");
