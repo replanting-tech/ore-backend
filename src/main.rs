@@ -2316,10 +2316,6 @@ pub async fn setup_database(_pool: &PgPool) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
-    info!("Database tables created/verified");
-    Ok(())
-}
-
 // ============================================================================
 // API Handlers
 // ============================================================================
