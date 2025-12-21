@@ -2311,76 +2311,10 @@ pub mod blockchain {
 // Database Setup
 // ============================================================================
 
-pub async fn setup_database(pool: &PgPool) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS users (
-            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-            wallet_address VARCHAR(44) UNIQUE NOT NULL,
-            email VARCHAR(255),
-            burner_wallet VARCHAR(44),
-            created_at TIMESTAMPTZ DEFAULT NOW(),
-            updated_at TIMESTAMPTZ DEFAULT NOW()
-        );
-
-        CREATE TABLE IF NOT EXISTS mining_sessions (
-            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-            user_id UUID NOT NULL REFERENCES users(id),
-            round_id BIGINT NOT NULL,
-            deployed_amount BIGINT NOT NULL,
-            squares INTEGER[] NOT NULL,
-            status VARCHAR(50) NOT NULL DEFAULT 'active',
-            rewards_sol BIGINT DEFAULT 0,
-            rewards_ore BIGINT DEFAULT 0,
-            claimed BOOLEAN DEFAULT FALSE,
-            profitability VARCHAR(20), -- "win", "loss", "breakeven", or null
-            winning_square INTEGER,
-            created_at TIMESTAMPTZ DEFAULT NOW(),
-            updated_at TIMESTAMPTZ DEFAULT NOW()
-        );
-
-        CREATE TABLE IF NOT EXISTS martingale_strategies (
-            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-            user_id UUID NOT NULL REFERENCES users(id),
-            wallet_address VARCHAR(44) NOT NULL,
-            base_amount_sol DOUBLE PRECISION NOT NULL,
-            loss_multiplier DOUBLE PRECISION NOT NULL,
-            status VARCHAR(20) NOT NULL DEFAULT 'active',
-            current_round INTEGER DEFAULT 0,
-            current_amount_sol DOUBLE PRECISION NOT NULL,
-            total_deployed_sol DOUBLE PRECISION DEFAULT 0,
-            total_rewards_sol DOUBLE PRECISION DEFAULT 0,
-            total_loss_sol DOUBLE PRECISION DEFAULT 0,
-            last_round_id BIGINT,
-            squares INTEGER[],
-            auto_claim_rounds INTEGER DEFAULT 5,
-            rounds_since_last_claim INTEGER DEFAULT 0,
-            created_at TIMESTAMPTZ DEFAULT NOW(),
-            updated_at TIMESTAMPTZ DEFAULT NOW()
-        );
-
-        CREATE TABLE IF NOT EXISTS fee_history (
-            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-            wallet_address VARCHAR(44) NOT NULL,
-            amount_sol DOUBLE PRECISION NOT NULL,
-            signature VARCHAR(88) NOT NULL,
-            operation_type VARCHAR(50) NOT NULL,
-            created_at TIMESTAMPTZ DEFAULT NOW()
-        );
-
-        -- Add columns if they don't exist for existing tables
-        ALTER TABLE martingale_strategies ADD COLUMN IF NOT EXISTS auto_claim_rounds INTEGER DEFAULT 5;
-        ALTER TABLE martingale_strategies ADD COLUMN IF NOT EXISTS rounds_since_last_claim INTEGER DEFAULT 0;
-
-        CREATE INDEX IF NOT EXISTS idx_sessions_user ON mining_sessions(user_id);
-        CREATE INDEX IF NOT EXISTS idx_sessions_round ON mining_sessions(round_id);
-        CREATE INDEX IF NOT EXISTS idx_martingale_user ON martingale_strategies(user_id);
-        CREATE INDEX IF NOT EXISTS idx_martingale_wallet_address ON martingale_strategies(wallet_address);
-        CREATE INDEX IF NOT EXISTS idx_martingale_status ON martingale_strategies(status);
-        "#,
-    )
-    .execute(pool)
-    .await?;
+pub async fn setup_database(_pool: &PgPool) -> Result<(), sqlx::Error> {
+    info!("Database auto-setup skipped. Please ensure you have run the manual SQL migration script.");
+    Ok(())
+}
 
     info!("Database tables created/verified");
     Ok(())
