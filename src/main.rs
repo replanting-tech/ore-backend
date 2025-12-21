@@ -593,17 +593,8 @@ pub fn start_round_watcher(state: Arc<AppState>) {
                                     .execute(&state.db)
                                     .await;
 
-                                if strategy.last_round_id != Some(board.round_id as i64) {
-                                    info!("Ensuring auto-mining for strategy {} in round {}", strategy.id, board.round_id);
-                                    let state_clone = state.clone();
-                                    let strategy_clone = strategy.clone();
-                                    let round_id = board.round_id;
-                                    tokio::spawn(async move {
-                                        if let Err(e) = deploy_for_round(&state_clone, &strategy_clone, round_id).await {
-                                            error!("Failed to deploy for round {} in strategy {}: {}", round_id, strategy.id, e);
-                                        }
-                                    });
-                                }
+                                // Martingale deployment is now handled solely by run_auto_mining_strategy
+                                // to avoid race conditions and ensure updated strategy data is used.
                             }
 
                             round_start_time = Some(current_time);
@@ -975,42 +966,58 @@ where
     Fut: std::future::Future<Output = Result<T, ApiError>>,
 {
     let mut attempts = 0;
-    let max_attempts = 3;
+    let mut account_not_found_attempts = 0;
+    const MAX_ATTEMPTS: usize = 5;
+    const MAX_ACCOUNT_NOT_FOUND_ATTEMPTS: usize = 2;
 
     loop {
         match operation().await {
             Ok(result) => return Ok(result),
-            Err(ApiError::Rpc(ref e)) => {
+            Err(e) => {
                 let error_msg = e.to_string();
+                attempts += 1;
 
-                // Check if it's a rate limiting error
+                // Handle rate limiting
                 if error_msg.contains("429") || error_msg.contains("Too Many Requests") {
-                    attempts += 1;
-                    if attempts >= max_attempts {
+                    if attempts >= MAX_ATTEMPTS {
                         error!("RPC rate limit exceeded after {} attempts: {}", attempts, error_msg);
                         return Err(ApiError::Internal(format!("RPC rate limit exceeded. The Solana network is experiencing high traffic. Please try again later.")));
                     }
 
-                    // Exponential backoff (500ms, 1s, 2s)
-                    let delay_millis = 500 * (2u64.pow(attempts - 1));
+                    // Exponential backoff (500ms, 1s, 2s, 4s)
+                    let delay_millis = 500 * (2u64.pow((attempts as u32).saturating_sub(1)));
                     let delay = Duration::from_millis(delay_millis);
-                    warn!("RPC rate limited, retrying in {:?} (attempt {}/{})", delay, attempts, max_attempts);
+                    warn!("RPC rate limited, retrying in {:?} (attempt {}/{})", delay, attempts, MAX_ATTEMPTS);
                     sleep(delay).await;
                     continue;
                 }
 
-                // Handle specific RPC errors with clear messages
+                // Handle transient AccountNotFound
+                if error_msg.contains("AccountNotFound") {
+                    account_not_found_attempts += 1;
+                    if account_not_found_attempts <= MAX_ACCOUNT_NOT_FOUND_ATTEMPTS && attempts < MAX_ATTEMPTS {
+                        let delay = Duration::from_millis(200);
+                        warn!("Account not found (possibly transient), retrying in {:?} (attempt {}/{})", delay, attempts, MAX_ATTEMPTS);
+                        sleep(delay).await;
+                        continue;
+                    }
+                    return Err(ApiError::NotFound);
+                }
+
+                // Handle other specific RPC errors
                 if error_msg.contains("Insufficient funds for fee") {
                     return Err(ApiError::BadRequest(
                         "Insufficient SOL balance to pay for transaction fees. Please ensure your account has enough SOL to cover transaction costs.".to_string()
                     ));
                 }
 
-                if error_msg.contains("AccountNotFound") {
-                    return Err(ApiError::NotFound);
-                }
-
                 if error_msg.contains("BlockhashNotFound") {
+                    if attempts < MAX_ATTEMPTS {
+                        let delay = Duration::from_millis(200);
+                        warn!("Blockhash not found, retrying in {:?} (attempt {}/{})", delay, attempts, MAX_ATTEMPTS);
+                        sleep(delay).await;
+                        continue;
+                    }
                     return Err(ApiError::Internal(
                         "Transaction blockhash not found. This may be due to network delays. Please try again.".to_string()
                     ));
@@ -1023,7 +1030,6 @@ where
                 }
 
                 if error_msg.contains("Transaction simulation failed") {
-                    // Extract more specific simulation error if possible
                     if error_msg.contains("custom program error") {
                         return Err(ApiError::Internal(
                             "Transaction failed due to program logic error. This may be a temporary issue with the ORE program.".to_string()
@@ -1034,19 +1040,28 @@ where
                     ));
                 }
 
-                if error_msg.contains("RPC response error") {
-                    return Err(ApiError::Internal(
-                        "Solana RPC network error. The blockchain network may be experiencing issues. Please try again later.".to_string()
-                    ));
+                // If it's a generic RPC error and we have attempts left, retry
+                if let ApiError::Rpc(_) = e {
+                    if attempts < MAX_ATTEMPTS {
+                        let delay = Duration::from_millis(500);
+                        warn!("RPC error, retrying in {:?} (attempt {}/{}): {}", delay, attempts, MAX_ATTEMPTS, error_msg);
+                        sleep(delay).await;
+                        continue;
+                    }
                 }
 
-                // For other RPC errors, return with generic message
-                error!("Unhandled RPC error: {}", error_msg);
+                // For all other cases or if exhausted attempts
+                if attempts >= MAX_ATTEMPTS {
+                    error!("RPC operation failed after {} attempts: {}", attempts, error_msg);
+                } else {
+                    // If not an RPC error, or we don't want to retry this specific error, return immediately
+                    return Err(e);
+                }
+                
                 return Err(ApiError::Internal(
-                    "Blockchain network error occurred. Please try again in a few moments.".to_string()
+                    format!("Blockchain network error occurred: {}. Please try again.", error_msg)
                 ));
             }
-            Err(other_error) => return Err(other_error),
         }
     }
 }
@@ -1221,16 +1236,7 @@ pub mod blockchain {
 
         with_rpc_retry(|| async {
             let board_pda = ore_api::state::board_pda();
-            let account = match rpc.get_account(&board_pda.0).await {
-                Ok(account) => account,
-                Err(e) => {
-                    // Handle account not found
-                    if e.to_string().contains("AccountNotFound") {
-                        return Err(ApiError::NotFound);
-                    }
-                    return Err(ApiError::Rpc(e));
-                }
-            };
+            let account = rpc.get_account(&board_pda.0).await?;
 
             // Slice to the exact size of Board struct, skipping 8-byte discriminator
             let board_size = std::mem::size_of::<ore_api::state::Board>();
@@ -1244,16 +1250,7 @@ pub mod blockchain {
                 .map_err(|e| ApiError::Internal(format!("Failed to parse board: {:?}", e)))?;
 
             // Get current clock
-            let clock_account = match rpc.get_account(&solana_sdk::sysvar::clock::ID).await {
-                Ok(account) => account,
-                Err(e) => {
-                    // Handle clock account not found
-                    if e.to_string().contains("AccountNotFound") {
-                        return Err(ApiError::NotFound);
-                    }
-                    return Err(ApiError::Rpc(e));
-                }
-            };
+            let clock_account = rpc.get_account(&solana_sdk::sysvar::clock::ID).await?;
             let clock: solana_sdk::clock::Clock = bincode::deserialize(&clock_account.data)
                 .map_err(|e| ApiError::Internal(format!("Clock deserialize error: {}", e)))?;
 
@@ -1301,15 +1298,7 @@ pub mod blockchain {
 
         with_rpc_retry(|| async {
             let round_pda = ore_api::state::round_pda(round_id);
-            let account = match rpc.get_account(&round_pda.0).await {
-                Ok(account) => account,
-                Err(e) => {
-                    if e.to_string().contains("AccountNotFound") {
-                        return Err(ApiError::NotFound);
-                    }
-                    return Err(ApiError::Rpc(e));
-                }
-            };
+            let account = rpc.get_account(&round_pda.0).await?;
 
             let round_size = std::mem::size_of::<ore_api::state::Round>();
             if account.data.len() < 8 + round_size {
@@ -1356,16 +1345,7 @@ pub mod blockchain {
 
         with_rpc_retry(|| async {
             let treasury_pda = ore_api::state::treasury_pda();
-            let account = match rpc.get_account(&treasury_pda.0).await {
-                Ok(account) => account,
-                Err(e) => {
-                    // Handle account not found
-                    if e.to_string().contains("AccountNotFound") {
-                        return Err(ApiError::NotFound);
-                    }
-                    return Err(ApiError::Rpc(e));
-                }
-            };
+            let account = rpc.get_account(&treasury_pda.0).await?;
 
             // Slice to the exact size of Treasury struct, skipping 8-byte discriminator
             let treasury_size = std::mem::size_of::<ore_api::state::Treasury>();
@@ -3136,6 +3116,21 @@ async fn run_auto_mining_strategy(state: Arc<AppState>, strategy_id: uuid::Uuid)
                     error!("Failed to process round result for strategy {}: {}", strategy_id, e);
                     // Continue anyway
                 }
+
+                // IMPORTANT: Re-fetch strategy to get updated current_amount_sol for the next deployment
+                if let Ok(Some(fresh_strategy)) = sqlx::query_as::<_, MartingaleStrategy>(
+                    "SELECT * FROM martingale_strategies WHERE id = $1"
+                )
+                .bind(strategy_id)
+                .fetch_optional(&state.db)
+                .await {
+                    info!("🔄 Strategy {} data refreshed after round results: next amount = {} SOL", strategy_id, fresh_strategy.current_amount_sol);
+                    // We can't easily replace 'strategy' here because it's used later in the loop
+                    // and comes from the 'match' binding at the top.
+                    // The easiest fix is to 'continue' the loop so it re-fetches at the top.
+                    last_round_id = Some(board.round_id);
+                    continue; 
+                }
             }
         }
 
@@ -3687,8 +3682,8 @@ async fn main() -> Result<(), anyhow::Error> {
         .test_before_acquire(true)        // Test connections before acquiring to prevent cached plan issues
         .connect(&config.database_url)
         .await?;
-    
-    // setup_database(&db).await?;
+
+    setup_database(&db).await?;
     info!("Database connected and initialized with connection pool");
 
     // Setup Redis
