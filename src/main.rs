@@ -2369,8 +2369,8 @@ pub async fn setup_database(pool: &PgPool) -> Result<(), sqlx::Error> {
         );
 
         -- Add columns if they don't exist for existing tables
-        sqlx::query("ALTER TABLE martingale_strategies ADD COLUMN IF NOT EXISTS auto_claim_rounds INTEGER DEFAULT 5").execute(&pool).await?;
-        sqlx::query("ALTER TABLE martingale_strategies ADD COLUMN IF NOT EXISTS rounds_since_last_claim INTEGER DEFAULT 0").execute(&pool).await?;
+        ALTER TABLE martingale_strategies ADD COLUMN IF NOT EXISTS auto_claim_rounds INTEGER DEFAULT 5;
+        ALTER TABLE martingale_strategies ADD COLUMN IF NOT EXISTS rounds_since_last_claim INTEGER DEFAULT 0;
 
         CREATE INDEX IF NOT EXISTS idx_sessions_user ON mining_sessions(user_id);
         CREATE INDEX IF NOT EXISTS idx_sessions_round ON mining_sessions(round_id);
