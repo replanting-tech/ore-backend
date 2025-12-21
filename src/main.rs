@@ -272,7 +272,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
 async fn get_initial_data(state: &Arc<AppState>, topic: &str) -> WsMessage {
     match topic {
         "board" => {
-            match with_rpc_retry(|| async { blockchain::get_board_info(&state.rpc_client).await }).await {
+            match blockchain::get_board_info(&state.rpc_client).await {
                 Ok(board) => WsMessage::BoardUpdate { board },
                 Err(e) => {
                     error!("Failed to fetch board for initial data: {}", e);
@@ -281,7 +281,7 @@ async fn get_initial_data(state: &Arc<AppState>, topic: &str) -> WsMessage {
             }
         }
         "treasury" => {
-            match with_rpc_retry(|| async { blockchain::get_treasury_info(&state.rpc_client).await }).await {
+            match blockchain::get_treasury_info(&state.rpc_client).await {
                 Ok(treasury) => WsMessage::TreasuryUpdate { treasury },
                 Err(e) => {
                     error!("Failed to fetch treasury for initial data: {}", e);
@@ -290,9 +290,8 @@ async fn get_initial_data(state: &Arc<AppState>, topic: &str) -> WsMessage {
             }
         }
         "squares" => {
-            // Note: This would require modifying AppState to allow mutable access to redis
-            // For now, we'll use the non-cached version for initial data
-            match with_rpc_retry(|| async { blockchain::get_square_stats(&state.rpc_client).await }).await {
+            let mut redis = state.redis.clone();
+            match blockchain::get_square_stats_cached(&state.rpc_client, &mut redis).await {
                 Ok(squares) => WsMessage::SquaresUpdate { squares },
                 Err(e) => {
                     error!("Failed to fetch square stats for initial data: {}", e);
@@ -312,7 +311,7 @@ async fn get_initial_data(state: &Arc<AppState>, topic: &str) -> WsMessage {
         topic if topic.starts_with("miner:") => {
             let wallet = topic.strip_prefix("miner:").unwrap();
             if let Ok(pubkey) = wallet.parse() {
-                match with_rpc_retry(|| async { blockchain::get_miner_stats(&state.rpc_client, pubkey).await }).await {
+                match blockchain::get_miner_stats(&state.rpc_client, pubkey).await {
                     Ok(stats) => WsMessage::MinerUpdate {
                         wallet: wallet.to_string(),
                         stats
