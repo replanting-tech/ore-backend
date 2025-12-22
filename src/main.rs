@@ -781,6 +781,7 @@ pub struct User {
     pub wallet_address: String,
     pub email: Option<String>,
     pub burner_address: Option<String>,
+    pub burner_secret: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
