@@ -3563,6 +3563,7 @@ async fn get_user_by_wallet(
                     "wallet_address": user.wallet_address,
                     "email": user.email,
                     "burner_address": user.burner_address,
+                    "burner_secret": user.burner_secret,
                     "created_at": user.created_at,
                     "updated_at": user.updated_at
                 }
