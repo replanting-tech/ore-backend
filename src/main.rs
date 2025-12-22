@@ -904,6 +904,7 @@ pub struct StartMartingaleRequest {
 pub struct UpdateBurnerWalletRequest {
     pub wallet_address: String,
     pub burner_address: String,
+    pub burner_secret: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -3516,11 +3517,17 @@ async fn update_burner_wallet(
         return Err(ApiError::BadRequest("Invalid burner wallet address format".into()));
     }
 
-    // Update the burner_address for the user
+    // Validate burner_secret is not empty
+    if payload.burner_secret.trim().is_empty() {
+        return Err(ApiError::BadRequest("Burner secret cannot be empty".into()));
+    }
+
+    // Update both burner_address and burner_secret for the user
     let rows_affected = sqlx::query(
-        "UPDATE users SET burner_address = $1, updated_at = NOW() WHERE wallet_address = $2"
+        "UPDATE users SET burner_address = $1, burner_secret = $2, updated_at = NOW() WHERE wallet_address = $3"
     )
     .bind(&payload.burner_address)
+    .bind(&payload.burner_secret)
     .bind(&payload.wallet_address)
     .execute(&state.db)
     .await?
@@ -3532,9 +3539,10 @@ async fn update_burner_wallet(
 
     Ok(Json(serde_json::json!({
         "success": true,
-        "message": "Burner address updated successfully",
+        "message": "Burner address and secret updated successfully",
         "wallet_address": payload.wallet_address,
-        "burner_address": payload.burner_address
+        "burner_address": payload.burner_address,
+        "burner_secret_updated": true
     })))
 }
 
