@@ -2445,19 +2445,21 @@ async fn get_user_sessions(
 
 // Helper function to get or create user by wallet address
 async fn get_or_create_user(db: &PgPool, wallet_address: &str) -> Result<User, ApiError> {
-    // Try to find existing user
+    // Try to find existing user first
     if let Ok(user) = sqlx::query_as::<_, User>(
         "SELECT * FROM users WHERE wallet_address = $1"
     )
     .bind(wallet_address)
-    .fetch_one(db)
+    .fetch_optional(db)
     .await {
-        return Ok(user);
+        if let Some(user) = user {
+            return Ok(user);
+        }
     }
 
     // Create new user if not found
     let user = sqlx::query_as::<_, User>(
-        "INSERT INTO users (wallet_address) VALUES ($1) RETURNING *"
+        "INSERT INTO users (wallet_address) VALUES ($1) ON CONFLICT (wallet_address) DO UPDATE SET updated_at = NOW() RETURNING *"
     )
     .bind(wallet_address)
     .fetch_one(db)
