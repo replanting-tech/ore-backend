@@ -3537,6 +3537,46 @@ async fn update_burner_wallet(
     })))
 }
 
+async fn get_user_by_wallet(
+    State(state): State<Arc<AppState>>,
+    Path(wallet_address): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    // Validate wallet address length
+    if wallet_address.len() != 44 {
+        return Err(ApiError::BadRequest("Invalid wallet address format: must be exactly 44 characters".into()));
+    }
+
+    // Get user from database
+    let user: Option<User> = sqlx::query_as::<_, User>(
+        "SELECT * FROM users WHERE wallet_address = $1"
+    )
+    .bind(&wallet_address)
+    .fetch_optional(&state.db)
+    .await?;
+
+    match user {
+        Some(user) => {
+            Ok(Json(serde_json::json!({
+                "success": true,
+                "user": {
+                    "id": user.id,
+                    "wallet_address": user.wallet_address,
+                    "email": user.email,
+                    "burner_address": user.burner_address,
+                    "created_at": user.created_at,
+                    "updated_at": user.updated_at
+                }
+            })))
+        }
+        None => {
+            Ok(Json(serde_json::json!({
+                "success": false,
+                "message": "User not found"
+            })))
+        }
+    }
+}
+
 // ============================================================================
 // Router
 // ============================================================================
@@ -3562,6 +3602,7 @@ fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/stats/global", get(global_stats))
         .route("/api/miner/:wallet/history", get(deployment_history))
         .route("/api/user/burner-address", post(update_burner_wallet))
+        .route("/api/user/:wallet_address", get(get_user_by_wallet))
         .layer(
             CorsLayer::new()
                 .allow_origin(AllowOrigin::any())
@@ -3675,6 +3716,7 @@ async fn main() -> Result<(), anyhow::Error> {
     info!("   GET  /api/miner/:wallet/sessions");
     info!("   GET  /api/miner/:wallet/history    <- Deployment history with win/loss");
     info!("   POST /api/user/register");
+    info!("   GET  /api/user/:wallet_address     <- Get user details including burner address");
     info!("   POST /api/deploy");
     info!("   POST /api/claim");
     info!("   POST /api/checkpoint");
